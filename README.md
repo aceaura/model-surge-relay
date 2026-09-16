@@ -53,6 +53,8 @@ docker compose up -d --build
 
 ## 调度面 API
 
+完整 API 参考（含全部字段表、错误码表与请求/响应示例）见 [docs/api.md](docs/api.md)，本节为速览。
+
 密钥：`Authorization: Bearer $MSR_DISPATCH_KEY`。
 
 | 方法 | 路径 | 说明 |
