@@ -9,6 +9,9 @@ import (
 // ResolvedTarget 是下发面返回的目标全套信息。Headers 含认证头，
 // 因此 String() 脱敏而 MarshalJSON 输出原值——响应带凭据、日志不带凭据
 // 由类型本身保证，不依赖调用点自觉。
+//
+// Defaults 与 Overrides 是两层未合并的参数：前者缺失才填、后者强制压盖。
+// 下发面刻意不合并，本服务也只搬运，由数据面作用到上游请求体上。
 type ResolvedTarget struct {
 	ModelID       string            `json:"model_id"`
 	Account       string            `json:"account"`
@@ -18,7 +21,8 @@ type ResolvedTarget struct {
 	NativeModel   string            `json:"native_model"`
 	ContextWindow int               `json:"context_window,omitempty"`
 	Headers       map[string]string `json:"headers"`
-	Params        json.RawMessage   `json:"params,omitempty"`
+	Defaults      json.RawMessage   `json:"defaults,omitempty"`
+	Overrides     json.RawMessage   `json:"overrides,omitempty"`
 }
 
 // sensitiveHeaders 是日志脱敏时需要遮蔽的头（大小写不敏感比较）。

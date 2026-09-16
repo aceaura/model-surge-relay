@@ -21,7 +21,8 @@ func fullTarget() Target {
 			"x-api-key":         "sk-secret-value-1234",
 			"anthropic-version": "2023-06-01",
 		},
-		Params: json.RawMessage(`{"temperature":0.6}`),
+		Defaults:  json.RawMessage(`{"temperature":0.6}`),
+		Overrides: json.RawMessage(`{"max_tokens":8192}`),
 	}
 }
 
@@ -36,7 +37,7 @@ func TestTargetSerializesEveryUpstreamField(t *testing.T) {
 	}
 	for _, key := range []string{
 		"model_id", "account", "provider_id", "protocol",
-		"base_url", "native_model", "context_window", "headers", "params",
+		"base_url", "native_model", "context_window", "headers", "defaults", "overrides",
 	} {
 		if _, ok := got[key]; !ok {
 			t.Errorf("field %q missing from %s", key, raw)
@@ -90,7 +91,8 @@ func TestTargetFromResolvedCopiesEveryField(t *testing.T) {
 		NativeModel:   "deepseek-v4-1-flash",
 		ContextWindow: 1048576,
 		Headers:       map[string]string{"Authorization": "Bearer sk-ark"},
-		Params:        json.RawMessage(`{"top_p":0.9}`),
+		Defaults:      json.RawMessage(`{"top_p":0.9}`),
+		Overrides:     json.RawMessage(`{"max_tokens":4096}`),
 	}
 	got := TargetFromResolved(src)
 	if got.ModelID != src.ModelID || got.Account != src.Account ||
@@ -98,7 +100,8 @@ func TestTargetFromResolvedCopiesEveryField(t *testing.T) {
 		got.BaseURL != src.BaseURL || got.NativeModel != src.NativeModel ||
 		got.ContextWindow != src.ContextWindow ||
 		got.Headers["Authorization"] != src.Headers["Authorization"] ||
-		string(got.Params) != string(src.Params) {
+		string(got.Defaults) != string(src.Defaults) ||
+		string(got.Overrides) != string(src.Overrides) {
 		t.Fatalf("conversion dropped a field: %+v vs %+v", got, src)
 	}
 }

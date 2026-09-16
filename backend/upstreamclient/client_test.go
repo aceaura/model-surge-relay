@@ -65,7 +65,7 @@ func TestResolveReturnsFullTarget(t *testing.T) {
 		_, _ = w.Write([]byte(`{"model_id":"kimi-1/k3","account":"kimi-1","provider_id":"kimi",
 			"protocol":"anthropic","base_url":"https://api.example.test/coding","native_model":"k3",
 			"context_window":262144,"headers":{"x-api-key":"super-secret-1234","anthropic-version":"2023-06-01"},
-			"params":{"temperature":0.6}}`))
+			"defaults":{"temperature":0.6},"overrides":{"max_tokens":8192}}`))
 	})
 
 	got, err := c.Resolve(context.Background(), "kimi-1/k3")
@@ -78,8 +78,11 @@ func TestResolveReturnsFullTarget(t *testing.T) {
 	if got.Headers["x-api-key"] != "super-secret-1234" {
 		t.Error("credential header must reach the caller verbatim")
 	}
-	if string(got.Params) != `{"temperature":0.6}` {
-		t.Errorf("params = %s", got.Params)
+	if string(got.Defaults) != `{"temperature":0.6}` {
+		t.Errorf("defaults = %s", got.Defaults)
+	}
+	if string(got.Overrides) != `{"max_tokens":8192}` {
+		t.Errorf("overrides = %s", got.Overrides)
 	}
 }
 

@@ -88,7 +88,8 @@ func newStubUpstream(t *testing.T, models []upstreamclient.Listing) *stubUpstrea
 			NativeModel:   found.NativeModel,
 			ContextWindow: found.ContextWindow,
 			Headers:       map[string]string{"Authorization": "Bearer sk-live-" + found.Account},
-			Params:        json.RawMessage(`{"temperature":0.6}`),
+			Defaults:      json.RawMessage(`{"temperature":0.6}`),
+			Overrides:     json.RawMessage(`{"max_tokens":8192}`),
 		})
 	})
 	s.server = httptest.NewServer(mux)
@@ -317,8 +318,11 @@ func TestEndToEndDispatchCarriesFullTargetAndProvenance(t *testing.T) {
 	if tgt.Headers["Authorization"] != "Bearer sk-live-kimi-1" {
 		t.Fatalf("headers = %v, credentials must pass through", tgt.Headers)
 	}
-	if string(tgt.Params) != `{"temperature":0.6}` {
-		t.Fatalf("params = %s", tgt.Params)
+	if string(tgt.Defaults) != `{"temperature":0.6}` {
+		t.Fatalf("defaults = %s", tgt.Defaults)
+	}
+	if string(tgt.Overrides) != `{"max_tokens":8192}` {
+		t.Fatalf("overrides = %s", tgt.Overrides)
 	}
 	d := resp.Decision
 	if d.Policy != "dynamic" || d.PolicyVersion != 1 || d.Collection != "c1" ||

@@ -32,6 +32,9 @@ type DispatchRequest struct {
 
 // Target 是选中 upstream model 的全套信息。Headers 含认证头：
 // MarshalJSON 输出原值供调用方直接发请求，String() 脱敏供日志。
+//
+// Defaults 与 Overrides 是两层未合并的参数：前者缺失才填、后者强制压盖。
+// 本服务只搬运不解释，由数据面在编码出上游请求体之后逐层作用上去。
 type Target struct {
 	ModelID       string            `json:"model_id"`
 	Account       string            `json:"account"`
@@ -41,7 +44,8 @@ type Target struct {
 	NativeModel   string            `json:"native_model"`
 	ContextWindow int               `json:"context_window,omitempty"`
 	Headers       map[string]string `json:"headers"`
-	Params        json.RawMessage   `json:"params,omitempty"`
+	Defaults      json.RawMessage   `json:"defaults,omitempty"`
+	Overrides     json.RawMessage   `json:"overrides,omitempty"`
 }
 
 func TargetFromResolved(t upstreamclient.ResolvedTarget) Target {
@@ -54,7 +58,8 @@ func TargetFromResolved(t upstreamclient.ResolvedTarget) Target {
 		NativeModel:   t.NativeModel,
 		ContextWindow: t.ContextWindow,
 		Headers:       t.Headers,
-		Params:        t.Params,
+		Defaults:      t.Defaults,
+		Overrides:     t.Overrides,
 	}
 }
 
