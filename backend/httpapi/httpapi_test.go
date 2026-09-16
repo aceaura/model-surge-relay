@@ -496,6 +496,7 @@ func TestAdminCollectionRoutes(t *testing.T) {
 		{"get", http.MethodGet, "/admin/collections/c1", "", http.StatusOK},
 		{"update", http.MethodPut, "/admin/collections/c1", `{"note":"edited"}`, http.StatusNoContent},
 		{"delete", http.MethodDelete, "/admin/collections/c1", "", http.StatusNoContent},
+		{"snapshot", http.MethodGet, "/admin/collections/c1/snapshot", "", http.StatusOK},
 		{"list groups", http.MethodGet, "/admin/collections/c1/groups", "", http.StatusOK},
 		{"create group", http.MethodPost, "/admin/collections/c1/groups", `{"name":"g","type":"fast"}`, http.StatusCreated},
 		{"update group", http.MethodPut, "/admin/collections/c1/groups/g", `{"type":"cheap"}`, http.StatusNoContent},

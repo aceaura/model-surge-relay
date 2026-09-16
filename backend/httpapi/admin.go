@@ -20,6 +20,9 @@ func (s *Server) routeAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("PUT "+base+"/collections/{name}", s.updateCollection)
 	mux.HandleFunc("DELETE "+base+"/collections/{name}", s.deleteCollection)
 
+	// snapshot 暴露成员叠加 upstream 目录属性后的视图（known / enabled / protocol 等）。
+	// groups 端点只返回成员引用字符串，管理面无从判断引用是否仍然有效。
+	mux.HandleFunc("GET "+base+"/collections/{name}/snapshot", s.getSnapshot)
 	mux.HandleFunc("GET "+base+"/collections/{name}/groups", s.listGroups)
 	mux.HandleFunc("POST "+base+"/collections/{name}/groups", s.createGroup)
 	mux.HandleFunc("PUT "+base+"/collections/{name}/groups/{group}", s.updateGroup)
@@ -98,6 +101,15 @@ func (s *Server) deleteCollection(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) getSnapshot(w http.ResponseWriter, r *http.Request) {
+	out, err := s.Collections.Snapshot(r.Context(), r.PathValue("name"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 type groupBody struct {

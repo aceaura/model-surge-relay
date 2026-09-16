@@ -86,6 +86,19 @@ docker compose up -d --build
 - `dry-run` 读真实 Collection 快照，但运行态由调用方给定，不碰真实运行态、不解析目标。
 - `DELETE /admin/runtime/{model_id...}` 用多段通配，因为 model_id 形如 `kimi-1/k3`，含斜杠。Reset 清冷却与失败计数，但**保留用量**（那是审计数据）。
 
+## 管理面 UI
+
+`frontend/` 是配套的 Flutter Windows 桌面管理面，直接调用上面的管理面 API。
+
+```bash
+cd frontend
+flutter run -d windows
+```
+
+首次启动填服务地址与 `MSR_ADMIN_KEY`，之后记在本机。四个页面分别管：集合与组成员编排、策略（含试运行）、对外模型名、运行态。
+
+细节与几处反直觉的语义见 `frontend/README.md`。
+
 ## 策略编写
 
 支持 `lua` / `javascript` / `typescript`。TypeScript 经 esbuild 转 ES2015 后与 JS 共用 goja 执行路径。脚本用 `return` 返回决策。
