@@ -1,0 +1,49 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: msr
+      POSTGRES_PASSWORD: ${MSR_PG_PASSWORD:-msr}
+      POSTGRES_DB: msr
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U msr -d msr"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  backend:
+    build: ./backend
+    environment:
+      MSR_PG_DSN: postgres://msr:${MSR_PG_PASSWORD:-msr}@postgres:5432/msr?sslmode=disable
+      MSR_REDIS_ADDR: redis:6379
+      # 密钥必须从环境传入，无默认值：缺失时服务启动即失败。
+      # 调度密钥与管理密钥必须不同，否则两个面不再隔离，服务同样拒绝启动。
+      MSR_DISPATCH_KEY: ${MSR_DISPATCH_KEY:?MSR_DISPATCH_KEY is required}
+      MSR_ADMIN_KEY: ${MSR_ADMIN_KEY:?MSR_ADMIN_KEY is required}
+      MSR_UPSTREAM_BASE_URL: ${MSR_UPSTREAM_BASE_URL:?MSR_UPSTREAM_BASE_URL is required}
+      MSR_UPSTREAM_DELIVERY_KEY: ${MSR_UPSTREAM_DELIVERY_KEY:?MSR_UPSTREAM_DELIVERY_KEY is required}
+      MSR_LISTEN: ":8080"
+    ports:
+      - "8081:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  pgdata:
