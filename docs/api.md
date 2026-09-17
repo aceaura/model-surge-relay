@@ -341,6 +341,12 @@ POST /admin/collections
 | `name` | string | 是 | 非空（trim 后）；全局唯一 | 集合名。重名 → `409` |
 | `note` | string | 否 | 自由文本，缺省空串 | 备注 |
 
+**请求示例**：
+
+```json
+{"name": "demo", "note": "演示集合"}
+```
+
 **响应** `201` + `Collection` 实体。
 
 #### 4.1.3 查询集合
@@ -370,6 +376,12 @@ PUT /admin/collections/{name}
 | 字段 | 类型 | 必填 | 允许取值 / 约束 | 含义 |
 | --- | --- | --- | --- | --- |
 | `note` | string | 是（可为空串） | 自由文本 | 新备注。`name` 字段即使提交也被忽略 |
+
+**请求示例**：
+
+```json
+{"note": "新备注"}
+```
 
 **响应** `204`（无体）。集合不存在 → `404`。
 
@@ -409,7 +421,7 @@ GET /admin/collections/{name}/groups
 | `name` | string | 恒有 | 组名，集合内唯一 |
 | `type` | string | 恒有 | 组类型，**自由文本**（如 `fast` / `cheap`），语义由策略脚本约定，服务不解释；创建时须非空 |
 | `position` | int | 恒有 | 排序键，任意整数，升序生效（惯例从 0 起） |
-| `config` | object | 恒有 | 组级参数（策略可见）。须为合法 JSON object；创建时空值归一为 `{}` |
+| `config` | 任意 JSON 值 | 恒有 | 组级参数，原样透传给策略（服务不解析、不校验形状）；写入缺省或空归一为 `{}`，惯例用 object |
 | `members` | `array<string>` | 恒有 | 成员 `model_id` 引用列表，按组内 position 序 |
 
 #### 4.2.2 创建组
@@ -427,7 +439,13 @@ POST /admin/collections/{name}/groups
 | `name` | string | 是 | 非空；集合内唯一 | 组名。重名 → `409` |
 | `type` | string | 是 | 非空 | 组类型（自由文本） |
 | `position` | int | 否 | 任意整数，缺省 0 | 排序位置 |
-| `config` | object | 否 | 合法 JSON object | 组级参数 |
+| `config` | 任意 JSON 值 | 否 | — | 组级参数；缺省 `{}` |
+
+**请求示例**：
+
+```json
+{"name": "primary", "type": "fast", "position": 0, "config": {"weight": 100}}
+```
 
 **响应** `201` + `Group` 实体。集合不存在 → `404`。
 
@@ -439,9 +457,24 @@ POST /admin/collections/{name}/groups
 PUT /admin/collections/{name}/groups/{group}
 ```
 
-**请求体**：同创建（`name` 字段被忽略，以路径为准）。**整体替换** `type` / `position` / `config`——不是"缺省保留"，未提交即归零/置空。
+**请求体**：
 
-**响应** `204`。集合或组不存在 → `404`。
+| 字段 | 类型 | 必填 | 允许取值 / 约束 | 含义 |
+| --- | --- | --- | --- | --- |
+| `name` | string | — | 忽略 | 以路径 `{group}` 为准 |
+| `type` | string | 是 | 非空 | 新组类型。缺失或空白 → `400`（`field: type`） |
+| `position` | int | 否 | 任意整数，缺省 0 | 新排序位置 |
+| `config` | 任意 JSON 值 | 否 | — | 新组级参数；缺省 `{}` |
+
+**整体替换**语义：三个字段一律以请求体为准，不是"缺省保留"——未提交的 `position` 归零、`config` 清成 `{}`。
+
+**请求示例**：
+
+```json
+{"type": "fast", "position": 0, "config": {"weight": 100}}
+```
+
+**响应** `204`。集合或组不存在 → `404`；`type` 缺失 → `400`。
 
 #### 4.2.4 删除组
 
@@ -465,9 +498,15 @@ PUT /admin/collections/{name}/groups/{group}/members
 
 | 字段 | 类型 | 必填 | 允许取值 / 约束 | 含义 |
 | --- | --- | --- | --- | --- |
-| `members` | `array<string>` | 是 | `model_id` 引用列表；可含尚不存在于目录的引用 | 最终成员清单；数组顺序即成员 position |
+| `members` | `array<string>` | 是 | `model_id` 引用列表，均须存在于 upstream 目录 | 最终成员清单（`[]` = 清空成员）；数组顺序即成员 position |
 
-不校验引用有效性——允许先挂引用再建上游模型；无效引用在快照中标 `known: false` 且调度时被跳过（原因 `unknown_model`）。
+写入时**逐引用校验**目录存在性：任一未知引用 → 整批拒绝 `400`（`field: members`，message 列出未知引用；目录不可达同样拒写）；同一引用重复 → `400`（`duplicate member`）。引用在写入后从目录消失（账号或模型被删）时，快照标 `known: false`，调度跳过（原因 `unknown_model`）。
+
+**请求示例**：
+
+```json
+{"members": ["kimi-k2-turbo", "ds-1/v4"]}
+```
 
 **响应** `204`。集合或组不存在 → `404`。
 
@@ -548,6 +587,12 @@ POST /admin/policies
 | `source` | string | 是 | 可编译的脚本源码 | 编译失败 → `400`，`message` 带行列号，**源码不入库** |
 | `note` | string | 否 | 自由文本 | 备注 |
 
+**请求示例**：
+
+```json
+{"name": "failover", "language": "lua", "source": "return { candidates = { \"kimi-k2-turbo\", \"ds-1/v4\" }, note = \"primary first\" }", "note": "按组顺序回退"}
+```
+
 **响应** `201` + `Policy` 实体（`version: 1`）。脚本输入结构见 [5.3](#53-策略脚本输入)。
 
 #### 4.4.3 查询策略
@@ -568,9 +613,24 @@ GET /admin/policies/{name}
 PUT /admin/policies/{name}
 ```
 
-**请求体**：同创建（`name` 以路径为准）。
+**请求体**：
 
-**响应** `200` + 更新后的 `Policy` 实体（`version` 可能递增）。编译失败 → `400` 且**不落任何变更**。不存在 → `404`。
+| 字段 | 类型 | 必填 | 允许取值 / 约束 | 含义 |
+| --- | --- | --- | --- | --- |
+| `name` | string | — | 忽略 | 以路径 `{name}` 为准 |
+| `language` | string | 是 | `lua` \| `javascript` \| `typescript`（大小写不敏感，自动 trim） | 脚本语言。缺失或集合外 → `400`（`field: language`，message 列出受支持集合） |
+| `source` | string | 是 | 可编译的脚本源码 | 编译失败 → `400`（`field: source`，message 带行列号），**不落任何变更** |
+| `note` | string | 否 | 自由文本；缺省空串 | 备注 |
+
+**整体替换**语义：三个字段一律以请求体为准，未提交的 `note` 会被清空。`version` 仅在 `source` 或 `language` 与旧值不同时 +1，只改 `note` 不动版本。
+
+**请求示例**：
+
+```json
+{"language": "lua", "source": "return { candidates = { \"ds-1/v4\", \"kimi-k2-turbo\" } }", "note": "新版脚本"}
+```
+
+**响应** `200` + 更新后的 `Policy` 实体。不存在 → `404`。
 
 #### 4.4.5 删除策略
 
@@ -617,6 +677,16 @@ POST /admin/policies/{name}/dry-run
 | `consecutive_failures` | int | ≥0 | 连续失败次数 |
 | `input_tokens` / `output_tokens` / `request_count` | int64 | ≥0 | 模拟用量 |
 
+**请求示例**：
+
+```json
+{
+  "collection": "demo",
+  "request": {"user_model": "demo-pool", "inbound_protocol": "anthropic", "est_tokens": 8192, "tried_ids": [], "request_id": "req-1"},
+  "runtime": {"kimi-k2-turbo": {"cooling": true, "cooling_until": 1790000000, "consecutive_failures": 3}}
+}
+```
+
 **响应** `200`：
 
 | 字段 | 类型 | 含义 |
@@ -659,7 +729,6 @@ GET /admin/user-models
 | `policy` | string | 绑定时 | 策略名；缺省 = 兜底顺序 |
 | `protocol` | string | 配置时 | 入站协议约束；缺省 = 不限 |
 | `enabled` | bool | 恒有 | `false` 时调度面返回 `403 disabled` |
-| `note` | string | 有备注时 | 备注 |
 | `created_at` / `updated_at` | time | 恒有 | 时间戳 |
 
 #### 4.6.2 创建
@@ -679,7 +748,13 @@ POST /admin/user-models
 | `client_key` | string | 是 | 非空 | 调用方密钥。只在创建/更新请求体中出现，任何读响应都不返回 |
 | `policy` | string | 否 | 须存在 | 绑定策略。不存在 → `400`（`field: policy`）；缺省 = 兜底顺序 |
 | `protocol` | string | 否 | `anthropic` \| `chat_completions` \| `responses` \| `gemini` | 入站协议约束；缺省 = 不限 |
-| `enabled` | bool | 否 | 缺省 `false` | 是否启用 |
+| `enabled` | bool | 否 | 缺省 `false` | 是否启用。**创建时缺省即停用**，要立刻可用需显式 `true` |
+
+**请求示例**：
+
+```json
+{"name": "demo-pool", "collection": "demo", "client_key": "sk-demo-pool-2026", "policy": "failover", "protocol": "anthropic", "enabled": true}
+```
 
 **响应** `201` + `UserModel` 实体（无密钥）。
 
@@ -701,7 +776,24 @@ GET /admin/user-models/{name}
 PUT /admin/user-models/{name}
 ```
 
-**请求体**：同创建（`name` 以路径为准）。**整体替换**语义，无"空则保留"：`client_key` 留空会提交空密钥导致鉴权必然失败——要保留原密钥必须重新填入。
+**请求体**：
+
+| 字段 | 类型 | 必填 | 允许取值 / 约束 | 含义 |
+| --- | --- | --- | --- | --- |
+| `name` | string | — | 忽略 | 以路径 `{name}` 为准 |
+| `collection` | string | 是 | 须存在 | 所属集合。不存在 → `400`（`field: collection`） |
+| `client_key` | string | 是 | 非空 | 新密钥。**必须重新提交**（响应从不回显旧值）；缺失或空串 → `400`（`field: client_key`） |
+| `policy` | string | 否 | 须存在，或空串 | 绑定策略；**空串 = 解绑**（改走兜底顺序）；不存在 → `400`（`field: policy`） |
+| `protocol` | string | 否 | `anthropic` \| `chat_completions` \| `responses` \| `gemini`，或空串 | 入站协议约束；**空串 = 不限** |
+| `enabled` | bool | 否 | 缺省 `false` | 是否启用。**漏提交即停用**，请显式携带 |
+
+**整体替换**语义，无"空则保留"：未提交的 `policy` / `protocol` 会被清空（解绑 / 不限）、`enabled` 归 `false`；`client_key` 旧值不回显，必须重填。
+
+**请求示例**：
+
+```json
+{"collection": "demo", "client_key": "sk-demo-pool-2026", "policy": "failover", "protocol": "anthropic", "enabled": true}
+```
 
 **响应** `200` + `UserModel` 实体。引用的 collection / policy 不存在 → `400`。不存在 → `404`。
 
@@ -812,7 +904,7 @@ dispatch 响应 `decision.skipped[].reason` 的取值，按过滤顺序排列：
 
 - `input` 结构里**没有任何凭据字段**——"策略读不到凭据"由类型定义保证，而非运行时过滤。
 - `input.runtime` 与 `input.request.tried_ids` 恒为容器（空为 `{}` / `[]`），不会是 `null`。
-- 返回值：Lua `return { candidates = {...}, note = "..." }`；JS/TS `return { candidates: [...], note: "..." }`。`candidates` 是 `model_id` 有序数组，`note` 可选。
+- 返回值两种形态等价：对象 `{ candidates = {...}, note = "..." }`（Lua）/ `{ candidates: [...], note: "..." }`（JS/TS），或裸的候选数组（Lua `return {...}`，等价于只带 `candidates`）。`candidates` 是 `model_id` 有序数组；`note` 可选；无返回等价于空候选数组。
 - 返回的候选仍会经调度过滤（已尝试/目录消失/禁用/冷却），脚本写错也不会把流量打到坏目标上。
 - 策略输入速查内置于管理界面（frontend/ 策略编辑页侧栏）；可执行范例见 `backend/policy/examples/`。
 
