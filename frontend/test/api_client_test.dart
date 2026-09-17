@@ -28,14 +28,14 @@ ApiClient _client(
 
 void main() {
   group('认证头', () {
-    test('管理面请求带 X-Admin-Key，且不带 Authorization', () async {
+    test('管理面请求带 Authorization: Bearer', () async {
       final captured = <http.BaseRequest>[];
       final client = _client(captured, body: '{"collections":[]}');
       await client.listCollections();
 
-      expect(captured.single.headers['X-Admin-Key'], 'admin-secret');
-      // 走错头会被后端当成调度面请求拒掉，这条断言守住的是"别用 Bearer"。
-      expect(captured.single.headers.containsKey('Authorization'), isFalse);
+      expect(captured.single.headers['Authorization'], 'Bearer admin-secret');
+      // 旧版用的自定义头已废弃，后端不再识别。
+      expect(captured.single.headers.containsKey('X-Admin-Key'), isFalse);
     });
   });
 

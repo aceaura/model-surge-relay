@@ -318,7 +318,7 @@ func (e *env) internal(t *testing.T, method, path, body string) (*http.Response,
 }
 
 func (e *env) admin(t *testing.T, method, path, body string) (*http.Response, string) {
-	return e.do(t, call{method, path, body, map[string]string{"X-Admin-Key": adminKey}})
+	return e.do(t, call{method, path, body, map[string]string{"Authorization": "Bearer " + adminKey}})
 }
 
 func TestDispatchKeyCannotReachAdmin(t *testing.T) {
@@ -333,10 +333,10 @@ func TestDispatchKeyCannotReachAdmin(t *testing.T) {
 	}
 }
 
-func TestAdminKeyCannotReachInternal(t *testing.T) {
+func TestAdminKeyCannotReachDispatch(t *testing.T) {
 	e := newEnv(t)
-	resp, _ := e.do(t, call{http.MethodGet, relayv1.InternalBasePath + "/models", "",
-		map[string]string{"X-Admin-Key": adminKey}})
+	resp, _ := e.do(t, call{http.MethodGet, relayv1.DispatchBasePath + "/models", "",
+		map[string]string{"Authorization": "Bearer " + adminKey}})
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", resp.StatusCode)
 	}
@@ -344,7 +344,7 @@ func TestAdminKeyCannotReachInternal(t *testing.T) {
 
 func TestMissingKeyIsUnauthorized(t *testing.T) {
 	e := newEnv(t)
-	for _, path := range []string{relayv1.InternalBasePath + "/models", "/admin/collections"} {
+	for _, path := range []string{relayv1.DispatchBasePath + "/models", "/admin/collections"} {
 		resp, _ := e.do(t, call{http.MethodGet, path, "", nil})
 		if resp.StatusCode != http.StatusUnauthorized {
 			t.Fatalf("%s status = %d, want 401", path, resp.StatusCode)
@@ -356,29 +356,44 @@ func TestEmptyConfiguredKeyDeniesEveryone(t *testing.T) {
 	srv := &Server{DispatchKey: "", AdminKey: "", Health: stubHealth{}}
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
-	req, _ := http.NewRequest(http.MethodGet, ts.URL+relayv1.InternalBasePath+"/health", nil)
-	req.Header.Set("Authorization", "Bearer ")
-	resp, err := ts.Client().Do(req)
-	if err != nil {
-		t.Fatalf("do: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("status = %d, want 401 (an unset key must not open the door)", resp.StatusCode)
+	for _, path := range []string{relayv1.DispatchBasePath + "/models", relayv1.AdminBasePath + "/collections"} {
+		req, _ := http.NewRequest(http.MethodGet, ts.URL+path, nil)
+		req.Header.Set("Authorization", "Bearer ")
+		resp, err := ts.Client().Do(req)
+		if err != nil {
+			t.Fatalf("do: %v", err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("%s status = %d, want 401 (an unset key must not open the door)", path, resp.StatusCode)
+		}
 	}
 }
 
-func TestHealthReportsThreeComponents(t *testing.T) {
+// Bearer 前缀大小写不敏感、其后允许空白，与 model-surge-upstream 的约定一致。
+func TestBearerPrefixIsCaseInsensitive(t *testing.T) {
 	e := newEnv(t)
-	resp, body := e.internal(t, http.MethodGet, relayv1.InternalBasePath+"/health", "")
+	for _, header := range []string{"bearer " + dispatchKey, "BEARER " + dispatchKey, "Bearer   " + dispatchKey} {
+		resp, _ := e.do(t, call{http.MethodGet, relayv1.DispatchBasePath + "/models", "",
+			map[string]string{"Authorization": header}})
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("header %q status = %d, want 200", header, resp.StatusCode)
+		}
+	}
+}
+
+// 健康检查免鉴权：探针与编排不持有密钥，带密钥反而是配置错误的信号。
+func TestHealthNeedsNoKey(t *testing.T) {
+	e := newEnv(t)
+	resp, body := e.do(t, call{http.MethodGet, relayv1.HealthPath, "", nil})
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200", resp.StatusCode)
+		t.Fatalf("status = %d, want 200 without any key", resp.StatusCode)
 	}
 	var got relayv1.HealthResponse
 	if err := json.Unmarshal([]byte(body), &got); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if got.Status != "ok" || got.Database != "ok" || got.Cache != "ok" || got.Upstream != "ok" {
+	if !got.Ready || !got.Database || !got.Cache || !got.Upstream {
 		t.Fatalf("health = %+v", got)
 	}
 }
@@ -386,7 +401,7 @@ func TestHealthReportsThreeComponents(t *testing.T) {
 func TestHealthUnreadyWhenDatabaseDown(t *testing.T) {
 	e := newEnv(t)
 	e.health.dbErr = errors.New("connection refused")
-	resp, body := e.internal(t, http.MethodGet, relayv1.InternalBasePath+"/health", "")
+	resp, body := e.do(t, call{http.MethodGet, relayv1.HealthPath, "", nil})
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503", resp.StatusCode)
 	}
@@ -394,7 +409,7 @@ func TestHealthUnreadyWhenDatabaseDown(t *testing.T) {
 	if err := json.Unmarshal([]byte(body), &got); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if got.Status != "unready" || got.Database != "unreachable" {
+	if got.Ready || got.Database {
 		t.Fatalf("health = %+v", got)
 	}
 }
@@ -403,18 +418,22 @@ func TestHealthDegradedCacheStaysReady(t *testing.T) {
 	e := newEnv(t)
 	e.health.cache = false
 	e.health.upstream = false
-	resp, body := e.internal(t, http.MethodGet, relayv1.InternalBasePath+"/health", "")
+	resp, body := e.do(t, call{http.MethodGet, relayv1.HealthPath, "", nil})
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (only PG gates readiness)", resp.StatusCode)
 	}
-	if !strings.Contains(body, `"cache":"disabled"`) {
-		t.Fatalf("body = %s", body)
+	var got relayv1.HealthResponse
+	if err := json.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !got.Ready || got.Cache || got.Upstream {
+		t.Fatalf("health = %+v", got)
 	}
 }
 
 func TestModelsEndpoint(t *testing.T) {
 	e := newEnv(t)
-	resp, body := e.internal(t, http.MethodGet, relayv1.InternalBasePath+"/models", "")
+	resp, body := e.internal(t, http.MethodGet, relayv1.DispatchBasePath+"/models", "")
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d", resp.StatusCode)
 	}
@@ -429,7 +448,7 @@ func TestModelsEndpoint(t *testing.T) {
 
 func TestDispatchEndpointReturnsTargetAndProvenance(t *testing.T) {
 	e := newEnv(t)
-	resp, body := e.internal(t, http.MethodPost, relayv1.InternalBasePath+"/dispatch",
+	resp, body := e.internal(t, http.MethodPost, relayv1.DispatchBasePath+"/dispatch",
 		`{"model":"sonnet","inbound_protocol":"anthropic","client_key":"sk-client","request_id":"req-1"}`)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, body %s", resp.StatusCode, body)
@@ -448,7 +467,7 @@ func TestDispatchEndpointReturnsTargetAndProvenance(t *testing.T) {
 
 func TestDispatchEndpointMapsErrorStatus(t *testing.T) {
 	e := newEnv(t)
-	resp, body := e.internal(t, http.MethodPost, relayv1.InternalBasePath+"/dispatch",
+	resp, body := e.internal(t, http.MethodPost, relayv1.DispatchBasePath+"/dispatch",
 		`{"model":"sonnet","client_key":"wrong","request_id":"req-1"}`)
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", resp.StatusCode)
@@ -464,7 +483,7 @@ func TestDispatchEndpointMapsErrorStatus(t *testing.T) {
 
 func TestMalformedBodyIsInvalidRequest(t *testing.T) {
 	e := newEnv(t)
-	resp, _ := e.internal(t, http.MethodPost, relayv1.InternalBasePath+"/dispatch", `{not json`)
+	resp, _ := e.internal(t, http.MethodPost, relayv1.DispatchBasePath+"/dispatch", `{not json`)
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", resp.StatusCode)
 	}
@@ -472,7 +491,7 @@ func TestMalformedBodyIsInvalidRequest(t *testing.T) {
 
 func TestResultsEndpointIsIdempotentShape(t *testing.T) {
 	e := newEnv(t)
-	resp, body := e.internal(t, http.MethodPost, relayv1.InternalBasePath+"/results",
+	resp, body := e.internal(t, http.MethodPost, relayv1.DispatchBasePath+"/results",
 		`{"report_id":"rep-1","request_id":"req-1","model_id":"kimi-1/k3","outcome":"normal"}`)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, body %s", resp.StatusCode, body)
@@ -662,7 +681,7 @@ func TestRuntimeResetUnknownTargetIs404(t *testing.T) {
 
 func TestUnknownMethodOnKnownPath(t *testing.T) {
 	e := newEnv(t)
-	resp, _ := e.internal(t, http.MethodDelete, relayv1.InternalBasePath+"/models", "")
+	resp, _ := e.internal(t, http.MethodDelete, relayv1.DispatchBasePath+"/models", "")
 	if resp.StatusCode != http.StatusMethodNotAllowed {
 		t.Fatalf("status = %d, want 405", resp.StatusCode)
 	}

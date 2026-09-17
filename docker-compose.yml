@@ -39,6 +39,12 @@ services:
       MSR_LISTEN: ":8080"
     ports:
       - "8081:8080"
+    healthcheck:
+      # /healthz 免鉴权，探针无需持有任何密钥。镜像是 alpine，只有 busybox wget。
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:8080/healthz || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
     depends_on:
       postgres:
         condition: service_healthy

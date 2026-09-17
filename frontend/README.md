@@ -20,7 +20,7 @@ flutter pub get
 flutter run -d windows
 ```
 
-首次启动会要求填 relay 服务地址与 `MSR_ADMIN_KEY`，保存后持久化到本机，之后直接进主界面。注意填的是**管理密钥**而不是调度密钥——两把密钥在服务端挂在不同的路由子树上，用错会一直 401。
+首次启动会要求填 relay 服务地址与 `MSR_ADMIN_KEY`，保存后持久化到本机，之后直接进主界面。密钥以 `Authorization: Bearer` 发出，与调度面同一个头、不同的密钥，注意填的是**管理密钥**而不是调度密钥——两把密钥在服务端挂在不同的路由子树上，用错会一直 401。
 
 想跳过首次配置，可以预写 `%APPDATA%\com.aceaura\msr_admin\shared_preferences.json`（键带 `flutter.` 前缀）：
 

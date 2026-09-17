@@ -79,26 +79,28 @@ type Server struct {
 }
 
 func (s *Server) Handler() http.Handler {
-	internal := http.NewServeMux()
-	internal.HandleFunc("GET "+relayv1.InternalBasePath+"/health", s.health)
-	internal.HandleFunc("GET "+relayv1.InternalBasePath+"/models", s.models)
-	internal.HandleFunc("POST "+relayv1.InternalBasePath+"/dispatch", s.dispatch)
-	internal.HandleFunc("POST "+relayv1.InternalBasePath+"/results", s.results)
+	dispatch := http.NewServeMux()
+	dispatch.HandleFunc("GET "+relayv1.DispatchBasePath+"/models", s.models)
+	dispatch.HandleFunc("POST "+relayv1.DispatchBasePath+"/dispatch", s.dispatch)
+	dispatch.HandleFunc("POST "+relayv1.DispatchBasePath+"/results", s.results)
 
 	admin := http.NewServeMux()
 	s.routeAdmin(admin)
 
 	root := http.NewServeMux()
-	root.Handle(relayv1.InternalBasePath+"/", requireBearer(s.DispatchKey, internal))
-	root.Handle(relayv1.AdminBasePath+"/", requireAdminKey(s.AdminKey, admin))
+	// 健康检查免鉴权：探活的调用方（编排、探针）不该持有任何密钥。
+	root.HandleFunc("GET "+relayv1.HealthPath, s.health)
+	root.Handle(relayv1.DispatchBasePath+"/", requireBearer(s.DispatchKey, dispatch))
+	root.Handle(relayv1.AdminBasePath+"/", requireBearer(s.AdminKey, admin))
 	return root
 }
 
-// requireBearer 校验调度密钥。失败响应只有错误码，不回显任何配置内容。
+// requireBearer 校验 Bearer 密钥。两面各持一个实例、密钥独立互不通用；
+// 校验挂在前缀子树上，因此先于子树内的路由匹配发生——跨面访问一律 401，
+// 不会泄漏"该路径是否存在"。失败响应只有错误码，不回显任何配置内容。
 func requireBearer(key string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		presented := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if !keyMatches(key, presented) {
+		if !keyMatches(key, bearer(r)) {
 			writeUnauthorized(w)
 			return
 		}
@@ -106,14 +108,14 @@ func requireBearer(key string, next http.Handler) http.Handler {
 	})
 }
 
-func requireAdminKey(key string, next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !keyMatches(key, r.Header.Get("X-Admin-Key")) {
-			writeUnauthorized(w)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
+// bearer 取 Authorization 头里的密钥。前缀大小写不敏感，其后允许空白。
+func bearer(r *http.Request) string {
+	raw := r.Header.Get("Authorization")
+	const prefix = "bearer "
+	if len(raw) < len(prefix) || !strings.EqualFold(raw[:len(prefix)], prefix) {
+		return ""
+	}
+	return strings.TrimSpace(raw[len(prefix):])
 }
 
 // keyMatches 空配置永不通过：未配置密钥的接口不该变成公开接口。
@@ -132,19 +134,16 @@ func writeUnauthorized(w http.ResponseWriter) {
 }
 
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
-	out := relayv1.HealthResponse{Status: "ok", Database: "ok", Cache: "disabled", Upstream: "unreachable"}
+	// PG 是权威存储，不可用即整体未就绪；缓存与上游只降级。
+	out := relayv1.HealthResponse{
+		Database: s.Health.PingDatabase(r.Context()) == nil,
+		Cache:    s.Health.CacheReady(r.Context()),
+		Upstream: s.Health.UpstreamReady(r.Context()),
+	}
+	out.Ready = out.Database
 	status := http.StatusOK
-	if err := s.Health.PingDatabase(r.Context()); err != nil {
-		// PG 是权威存储，不可用即整体未就绪。
-		out.Status = "unready"
-		out.Database = "unreachable"
+	if !out.Ready {
 		status = http.StatusServiceUnavailable
-	}
-	if s.Health.CacheReady(r.Context()) {
-		out.Cache = "ok"
-	}
-	if s.Health.UpstreamReady(r.Context()) {
-		out.Upstream = "ok"
 	}
 	writeJSON(w, status, out)
 }

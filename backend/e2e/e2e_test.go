@@ -226,7 +226,7 @@ func (e *env) request(t *testing.T, method, path, body string, header map[string
 }
 
 func (e *env) admin(t *testing.T, method, path, body string) (int, string) {
-	return e.request(t, method, path, body, map[string]string{"X-Admin-Key": adminKey})
+	return e.request(t, method, path, body, map[string]string{"Authorization": "Bearer " + adminKey})
 }
 
 func (e *env) internal(t *testing.T, method, path, body string) (int, string) {
@@ -282,7 +282,7 @@ func (e *env) dispatch(t *testing.T, requestID string, tried []string) (int, rel
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	status, body := e.internal(t, http.MethodPost, relayv1.InternalBasePath+"/dispatch", string(payload))
+	status, body := e.internal(t, http.MethodPost, relayv1.DispatchBasePath+"/dispatch", string(payload))
 	var out relayv1.DispatchResponse
 	if status == http.StatusOK {
 		if err := json.Unmarshal([]byte(body), &out); err != nil {
@@ -462,7 +462,7 @@ func TestEndToEndCoolingExcludesTargetOnNextDispatch(t *testing.T) {
 	for i := 1; i <= 2; i++ {
 		payload := fmt.Sprintf(
 			`{"report_id":"rep-%d","request_id":"req-1","model_id":"kimi-1/k3","outcome":"abnormal"}`, i)
-		status, body := e.internal(t, http.MethodPost, relayv1.InternalBasePath+"/results", payload)
+		status, body := e.internal(t, http.MethodPost, relayv1.DispatchBasePath+"/results", payload)
 		if status != http.StatusOK {
 			t.Fatalf("report %d = %d: %s", i, status, body)
 		}
@@ -491,11 +491,11 @@ func TestEndToEndDuplicateReportIsIdempotent(t *testing.T) {
 	e.setup(t, presetSource(t))
 	const payload = `{"report_id":"rep-dup","request_id":"req-1","model_id":"kimi-1/k3","outcome":"abnormal"}`
 
-	_, first := e.internal(t, http.MethodPost, relayv1.InternalBasePath+"/results", payload)
+	_, first := e.internal(t, http.MethodPost, relayv1.DispatchBasePath+"/results", payload)
 	if !strings.Contains(first, `"applied":true`) {
 		t.Fatalf("first report = %s", first)
 	}
-	_, second := e.internal(t, http.MethodPost, relayv1.InternalBasePath+"/results", payload)
+	_, second := e.internal(t, http.MethodPost, relayv1.DispatchBasePath+"/results", payload)
 	if !strings.Contains(second, `"applied":false`) {
 		t.Fatalf("replayed report = %s, want applied=false", second)
 	}
@@ -513,7 +513,7 @@ func TestEndToEndRuntimeResetRestoresTarget(t *testing.T) {
 	e := newEnv(t)
 	e.setup(t, presetSource(t))
 	for i := 1; i <= 2; i++ {
-		e.internal(t, http.MethodPost, relayv1.InternalBasePath+"/results",
+		e.internal(t, http.MethodPost, relayv1.DispatchBasePath+"/results",
 			fmt.Sprintf(`{"report_id":"r-%d","model_id":"kimi-1/k3","outcome":"abnormal"}`, i))
 	}
 	_, resp, _ := e.dispatch(t, "req-2", nil)
@@ -677,7 +677,7 @@ func TestEndToEndDispatchAuthFailures(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			status, body := e.internal(t, http.MethodPost, relayv1.InternalBasePath+"/dispatch", tc.body)
+			status, body := e.internal(t, http.MethodPost, relayv1.DispatchBasePath+"/dispatch", tc.body)
 			if status != tc.want {
 				t.Fatalf("status = %d, want %d: %s", status, tc.want, body)
 			}
@@ -700,7 +700,8 @@ func TestEndToEndDisabledUserModelRejected(t *testing.T) {
 
 func TestEndToEndHealthReportsComponents(t *testing.T) {
 	e := newEnv(t)
-	status, body := e.internal(t, http.MethodGet, relayv1.InternalBasePath+"/health", "")
+	// 不带任何密钥：健康检查免鉴权。
+	status, body := e.request(t, http.MethodGet, relayv1.HealthPath, "", nil)
 	if status != http.StatusOK {
 		t.Fatalf("status = %d: %s", status, body)
 	}
@@ -708,22 +709,18 @@ func TestEndToEndHealthReportsComponents(t *testing.T) {
 	if err := json.Unmarshal([]byte(body), &got); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if got.Status != "ok" || got.Database != "ok" || got.Upstream != "ok" {
+	if !got.Ready || !got.Database || !got.Upstream {
 		t.Fatalf("health = %+v", got)
 	}
-	wantCache := "disabled"
-	if os.Getenv("TEST_REDIS_ADDR") != "" {
-		wantCache = "ok"
-	}
-	if got.Cache != wantCache {
-		t.Fatalf("cache = %q, want %q", got.Cache, wantCache)
+	if wantCache := os.Getenv("TEST_REDIS_ADDR") != ""; got.Cache != wantCache {
+		t.Fatalf("cache = %v, want %v", got.Cache, wantCache)
 	}
 }
 
 func TestEndToEndModelsListing(t *testing.T) {
 	e := newEnv(t)
 	e.setup(t, presetSource(t))
-	status, body := e.internal(t, http.MethodGet, relayv1.InternalBasePath+"/models", "")
+	status, body := e.internal(t, http.MethodGet, relayv1.DispatchBasePath+"/models", "")
 	if status != http.StatusOK {
 		t.Fatalf("status = %d: %s", status, body)
 	}
@@ -746,9 +743,14 @@ func TestEndToEndKeyIsolation(t *testing.T) {
 	if status != http.StatusUnauthorized {
 		t.Fatalf("dispatch key on admin = %d, want 401", status)
 	}
-	status, _ = e.request(t, http.MethodGet, relayv1.InternalBasePath+"/models", "",
-		map[string]string{"X-Admin-Key": adminKey})
+	status, _ = e.request(t, http.MethodGet, relayv1.DispatchBasePath+"/models", "",
+		map[string]string{"Authorization": "Bearer " + adminKey})
 	if status != http.StatusUnauthorized {
-		t.Fatalf("admin key on internal = %d, want 401", status)
+		t.Fatalf("admin key on dispatch = %d, want 401", status)
+	}
+	// 健康检查在两面之外：无密钥可达。
+	status, _ = e.request(t, http.MethodGet, relayv1.HealthPath, "", nil)
+	if status != http.StatusOK {
+		t.Fatalf("healthz without key = %d, want 200", status)
 	}
 }

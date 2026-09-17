@@ -50,9 +50,9 @@ class ApiClient {
 
   static const _timeout = Duration(seconds: 15);
 
-  /// 管理面用 X-Admin-Key。调度面才用 Bearer，走错头会被后端当作另一个面拒掉。
+  /// 两面同用 Bearer，区分靠密钥本身：填了调度密钥会被后端一路 401。
   Map<String, String> get _headers => {
-        'X-Admin-Key': adminKey,
+        'Authorization': 'Bearer $adminKey',
         'Content-Type': 'application/json',
       };
 

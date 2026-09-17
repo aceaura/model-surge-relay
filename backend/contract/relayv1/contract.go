@@ -8,8 +8,10 @@ import (
 	"github.com/aceaura/model-surge-relay/backend/upstreamclient"
 )
 
+// 三组路由前缀。健康检查独立于两面且免鉴权：探活不该需要密钥。
 const (
-	InternalBasePath = "/internal/v1"
+	HealthPath       = "/healthz"
+	DispatchBasePath = "/v1"
 	AdminBasePath    = "/admin"
 )
 
@@ -139,11 +141,13 @@ type ModelsResponse struct {
 	Models []UserModelSummary `json:"models"`
 }
 
+// HealthResponse 的 Ready 恒等于 Database：PG 是权威存储，
+// 缓存与上游不可用只降级，不构成摘流理由。
 type HealthResponse struct {
-	Status   string `json:"status"`
-	Database string `json:"database"`
-	Cache    string `json:"cache"`
-	Upstream string `json:"upstream"`
+	Ready    bool `json:"ready"`
+	Database bool `json:"database"`
+	Cache    bool `json:"cache"`
+	Upstream bool `json:"upstream"`
 }
 
 type Error struct {

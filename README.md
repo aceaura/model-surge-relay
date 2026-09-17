@@ -5,9 +5,9 @@
 ## 三向对接关系
 
 ```
-model-surge-stream ──POST /internal/v1/dispatch──▶ model-surge-relay ──POST /v1/resolve──▶ model-surge-upstream
-       (数据面)      ◀──── target + decision ─────       (本服务)        ◀── target+headers ──   (静态配置中心)
-                    ──POST /internal/v1/results─▶
+model-surge-stream ──POST /v1/dispatch──▶ model-surge-relay ──POST /v1/resolve──▶ model-surge-upstream
+       (数据面)      ◀─── target + decision ───       (本服务)        ◀── target+headers ──   (静态配置中心)
+                    ──POST /v1/results──▶
 ```
 
 - **model-surge-upstream** 是静态配置中心，只回答"某个 upstream model 长什么样"并下发凭据。本服务只读它，不写、不代理其数据面。
@@ -23,8 +23,8 @@ model-surge-stream ──POST /internal/v1/dispatch──▶ model-surge-relay �
 | 变量 | 必填 | 默认 | 说明 |
 | --- | --- | --- | --- |
 | `MSR_PG_DSN` | 是 | | PostgreSQL DSN，权威存储 |
-| `MSR_DISPATCH_KEY` | 是 | | `/internal/v1/*` 的 Bearer 密钥 |
-| `MSR_ADMIN_KEY` | 是 | | `/admin/*` 的 `X-Admin-Key` 密钥，必须与 dispatch key 不同 |
+| `MSR_DISPATCH_KEY` | 是 | | `/v1/*` 的 Bearer 密钥 |
+| `MSR_ADMIN_KEY` | 是 | | `/admin/*` 的 Bearer 密钥，必须与 dispatch key 不同 |
 | `MSR_UPSTREAM_BASE_URL` | 是 | | model-surge-upstream 下发面地址 |
 | `MSR_UPSTREAM_DELIVERY_KEY` | 是 | | 下发面 Bearer 密钥 |
 | `MSR_REDIS_ADDR` | 否 | 空 | 留空则不启用缓存，全程直读 PG |
@@ -51,6 +51,10 @@ docker compose up -d --build
 
 数据库 DDL 由 `//go:embed schema.sql` 在启动时幂等执行，没有迁移框架。
 
+## 健康检查
+
+`GET /healthz`，**免鉴权**。响应 `{ready, database, cache, upstream}` 全为 bool；`ready` 恒等于 `database`（PG 是权威存储），缓存与上游不可用只降级标注，仍 200。PG 不可达返回 503。
+
 ## 调度面 API
 
 完整 API 参考（含全部字段表、错误码表与请求/响应示例）见 [docs/api.md](docs/api.md)，本节为速览。
@@ -59,10 +63,9 @@ docker compose up -d --build
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/internal/v1/health` | PG 不可用返回 503 `unready`；缓存/上游不可用只降级标注，仍 200 |
-| GET | `/internal/v1/models` | 可用 user model 列表，不含任何密钥 |
-| POST | `/internal/v1/dispatch` | 选目标，返回 target（含认证头）+ decision |
-| POST | `/internal/v1/results` | 回报结果，按 `report_id` 幂等 |
+| GET | `/v1/models` | 可用 user model 列表，不含任何密钥 |
+| POST | `/v1/dispatch` | 选目标，返回 target（含认证头）+ decision |
+| POST | `/v1/results` | 回报结果，按 `report_id` 幂等 |
 
 `dispatch` 请求体：`model` / `inbound_protocol` / `client_key` / `request_id` / `tried_ids` / `est_tokens`。`tried_ids` 里的目标会被排除，供数据面自行重试换目标。
 
@@ -70,7 +73,7 @@ docker compose up -d --build
 
 ## 管理面 API
 
-密钥：`X-Admin-Key: $MSR_ADMIN_KEY`。
+密钥：`Authorization: Bearer $MSR_ADMIN_KEY`。
 
 - Collection：`GET|POST /admin/collections`、`GET|PUT|DELETE /admin/collections/{name}`
 - Group：`GET|POST /admin/collections/{name}/groups`、`PUT|DELETE /admin/collections/{name}/groups/{group}`

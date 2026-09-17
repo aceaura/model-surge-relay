@@ -6,17 +6,18 @@
 | API 版本 | `v1`（契约定义：`backend/contract/relayv1`） |
 | 基准地址 | `http://<host>:8081`（compose 默认宿主映射 8081） |
 | 内容类型 | 请求与响应体均为 `application/json; charset=utf-8`；`204` 端点无响应体 |
-| 时间格式 | RFC 3339 UTC，如 `2026-09-16T10:04:02.448393Z`（例外：dry-run 的 `cooling_until` 为 Unix 秒，见 4.5） |
+| 时间格式 | RFC 3339 UTC，如 `2026-09-16T10:04:02.448393Z`（例外：dry-run 的 `cooling_until` 为 Unix 秒，见 5.5） |
 
 ## 目录
 
 - [1. 概述](#1-概述)
 - [2. 通用约定](#2-通用约定)
-- [3. 调度面 API](#3-调度面-api)
-  - [3.1 健康探测](#31-健康探测) · [3.2 模型列表](#32-模型列表) · [3.3 调度](#33-调度) · [3.4 结果上报](#34-结果上报)
-- [4. 管理面 API](#4-管理面-api)
-  - [4.1 Collection](#41-collection) · [4.2 Group 与成员](#42-group-与成员) · [4.3 集合快照](#43-集合快照) · [4.4 策略](#44-策略) · [4.5 策略试运行](#45-策略试运行) · [4.6 User Model](#46-user-model) · [4.7 运行态](#47-运行态)
-- [5. 附录](#5-附录)
+- [3. 健康检查](#3-健康检查)
+- [4. 调度面 API](#4-调度面-api)
+  - [4.1 模型列表](#41-模型列表) · [4.2 调度](#42-调度) · [4.3 结果上报](#43-结果上报)
+- [5. 管理面 API](#5-管理面-api)
+  - [5.1 Collection](#51-collection) · [5.2 Group 与成员](#52-group-与成员) · [5.3 集合快照](#53-集合快照) · [5.4 策略](#54-策略) · [5.5 策略试运行](#55-策略试运行) · [5.6 User Model](#56-user-model) · [5.7 运行态](#57-运行态)
+- [6. 附录](#6-附录)
 
 ---
 
@@ -33,16 +34,27 @@
 
 ### 2.1 认证
 
-| 平面 | 路径前缀 | 凭据 | 环境变量 |
+服务暴露两组接口与一个健康检查：
+
+| 分组 | 前缀 | 密钥 | 用途 |
 | --- | --- | --- | --- |
-| 调度面 | `/internal/v1` | `Authorization: Bearer <key>` | `MSR_DISPATCH_KEY` |
-| 管理面 | `/admin` | `X-Admin-Key: <key>` | `MSR_ADMIN_KEY` |
+| 健康检查 | `/healthz` | 无 | 依赖就绪状态 |
+| 管理面 | `/admin/*` | `MSR_ADMIN_KEY` | 配置的增删改查（桌面客户端使用） |
+| 调度面 | `/v1/*` | `MSR_DISPATCH_KEY` | 选目标与结果回报（数据面使用） |
 
-规则：
+除 `GET /healthz` 外，所有接口要求请求头：
 
-- 两把密钥必须不同（启动校验强制）；走错平面表现为 `401`。
-- 凭据错误与缺失的响应一致（`401` + `unauthorized`），不区分原因，不回显配置内容。
-- 平面未配置密钥时拒绝该平面一切请求——空密钥不是"无鉴权"。
+```
+Authorization: Bearer <密钥>
+```
+
+| 约定 | 说明 |
+| --- | --- |
+| 前缀 | `Bearer`，大小写不敏感；其后允许空白 |
+| 校验 | 常数时间比较（`crypto/subtle`），防时序侧信道 |
+| 失败 | 密钥缺失、格式不符或不正确一律 `401` `unauthorized`，不区分原因，不回显配置内容 |
+
+两把密钥相互独立：管理密钥访问调度面返回 `401`，反之亦然（密钥校验先于路由匹配，因此跨面访问不会泄漏"该路径是否存在"）。两者必须不同，启动时校验强制。某一面未配置密钥时拒绝该面一切请求——空密钥不是"无鉴权"。
 
 ### 2.2 通用类型
 
@@ -66,7 +78,7 @@
 
 | 字段 | 类型 | 出现条件 | 取值 / 含义 |
 | --- | --- | --- | --- |
-| `error.code` | string | 恒有 | 错误码，封闭集合，见 [5.1](#51-错误码表) |
+| `error.code` | string | 恒有 | 错误码，封闭集合，见 [6.1](#61-错误码表) |
 | `error.message` | string | 恒有 | 人可读说明（英文），不含凭据 |
 | `error.retryable` | bool | 恒有 | `true` = 换目标或稍后重试**可能**成功；是调用方重试决策的依据 |
 | `error.field` | string | 仅校验错误 | 出错字段名（如 `client_key`），供表单定位控件 |
@@ -81,39 +93,45 @@
 
 ---
 
-## 3. 调度面 API
+## 3. 健康检查
 
-### 3.1 健康探测
+### 3.1 查询就绪状态
 
-**使用场景**：探活与就绪判定。PG 不可用时服务整体未就绪；Redis 与 upstream 不可用只降级、不影响调度能力。
+**使用场景**：容器编排的 healthcheck、调用方启动自检。PG 不可用时服务整体未就绪；Redis 与 upstream 不可用只降级、不影响调度能力。
 
 ```http
-GET /internal/v1/health
+GET /healthz
 ```
 
-**请求**：无请求体，无路径参数。
+**请求**：无路径参数、无查询参数、无请求体；**免鉴权**。
 
-**响应** `200`（就绪）/ `503`（PG 不可用）：
+**响应** `200`（就绪）/ `503`（PG 不可达），字段相同：
 
-| 字段 | 类型 | 取值 | 含义 |
-| --- | --- | --- | --- |
-| `status` | string | `ok` \| `unready` | 整体就绪；仅由 database 决定 |
-| `database` | string | `ok` \| `unreachable` | PostgreSQL（权威存储）。`unreachable` ⇒ `status=unready` + HTTP 503 |
-| `cache` | string | `ok` \| `disabled` | Redis。`disabled` 仅降级（直查 PG），不影响就绪 |
-| `upstream` | string | `ok` \| `unreachable` | 配置中心下发面。`unreachable` 仅降级（解析目标会失败），不影响就绪 |
+| 字段 | 类型 | 取值与含义 |
+| --- | --- | --- |
+| `ready` | bool | 服务可用性，恒等于 `database` |
+| `database` | bool | PostgreSQL（权威存储）可达性；`false` 时整个服务判定不可用 |
+| `cache` | bool | Redis 可达性；**`false` 不影响 `ready`**——缓存仅是加速，故障时降级直查 PG。未配置 Redis（`MSR_REDIS_ADDR` 缺省）时恒为 `false` |
+| `upstream` | bool | 配置中心下发面可达性；**`false` 不影响 `ready`**——但此时解析目标会失败，调度将返回 `503 target_unavailable` |
 
 ```json
-{"status": "ok", "database": "ok", "cache": "ok", "upstream": "ok"}
+{"ready": true, "database": true, "cache": true, "upstream": true}
 ```
 
-**注意**：探活摘流只看 `status`（或 HTTP 状态码）；`cache` / `upstream` 的降级不构成摘流理由。
+> `503` 响应体是上述健康状态体，**不是** [2.3](#23-错误信封) 的错误信封。
 
-### 3.2 模型列表
+**注意**：探活摘流只看 `ready`（或 HTTP 状态码）；`cache` / `upstream` 的降级不构成摘流理由。
+
+---
+
+## 4. 调度面 API
+
+### 4.1 模型列表
 
 **使用场景**：数据面发现可调度的对外模型名（通常用于向客户端暴露模型清单）。
 
 ```http
-GET /internal/v1/models
+GET /v1/models
 ```
 
 **请求**：无请求体，无路径参数。
@@ -128,7 +146,7 @@ GET /internal/v1/models
 
 | 字段 | 类型 | 出现条件 | 取值 / 含义 |
 | --- | --- | --- | --- |
-| `name` | string | 恒有 | 对外模型名，作为 3.3 `model` 的取值 |
+| `name` | string | 恒有 | 对外模型名，作为 4.2 `model` 的取值 |
 | `collection` | string | 恒有 | 所属集合名 |
 | `policy` | string | 绑定了策略时 | 策略名；**缺省 = 走兜底顺序**（组顺序展平） |
 | `protocol` | string | 配置了约束时 | 期望入站协议；**缺省 = 不限** |
@@ -138,12 +156,12 @@ GET /internal/v1/models
 {"models": [{"name": "demo-pool", "collection": "demo", "policy": "failover", "protocol": "anthropic", "enabled": true}]}
 ```
 
-### 3.3 调度
+### 4.2 调度
 
 **使用场景**：数据面在转发客户端请求前调用，选出目标并获取其全套连接信息（含真实认证头）。每次客户端请求调用一次；换目标重试时把已试过的目标放进 `tried_ids` 再次调用。
 
 ```http
-POST /internal/v1/dispatch
+POST /v1/dispatch
 ```
 
 **请求体**：
@@ -204,7 +222,7 @@ POST /internal/v1/dispatch
 | 字段 | 类型 | 出现条件 | 取值 / 含义 |
 | --- | --- | --- | --- |
 | `model_id` | string | 恒有 | 被丢弃的候选 |
-| `reason` | string | 恒有 | 封闭集合，见 [5.2](#52-跳过原因) |
+| `reason` | string | 恒有 | 封闭集合，见 [6.2](#62-跳过原因) |
 | `detail` | string | `reason=resolve_failed` 时 | 解析失败的底层原因（不含凭据） |
 
 ```json
@@ -236,12 +254,12 @@ POST /internal/v1/dispatch
 | 策略脚本运行出错 | `503` `policy_error` | **否**（脚本 bug，重试必然再失败） |
 | 策略执行超时（默认 200ms，`MSR_POLICY_TIMEOUT` 可调） | `503` `policy_timeout` | 是 |
 
-### 3.4 结果上报
+### 4.3 结果上报
 
 **使用场景**：数据面在调用结束后（无论成败）回报结果，驱动用量统计与冷却。按 `report_id` 幂等——重复上报（含崩溃后重放）不会重复计数。
 
 ```http
-POST /internal/v1/results
+POST /v1/results
 ```
 
 **请求体**：
@@ -288,20 +306,20 @@ POST /internal/v1/results
 
 ---
 
-## 4. 管理面 API
+## 5. 管理面 API
 
-面向运维与 frontend/ 管理界面。全部需要 `X-Admin-Key`。通用约定：
+面向运维与 frontend/ 管理界面。全部需要 `Authorization: Bearer $MSR_ADMIN_KEY`。通用约定：
 
 - **列表端点解包装**（`{"<资源复数>": [...]}`）；**单体端点裸返实体**。
 - 创建成功 `201` + 实体；更新类端点有的返回实体（`200`）、有的无体（`204`），各端点分别注明。
 - user model 的 `client_key` 在任何读响应中都不出现。
 - 列表排序：collections / policies / user_models / runtime 按名称（或 model_id）字典序；groups 按 `position` 升序、并列按 `name`；组内成员按组内 `position` 升序、并列按 `model_id`。
 
-### 4.1 Collection
+### 5.1 Collection
 
 集合是配置顶层容器：名称 + 备注，下挂有序 Group。
 
-#### 4.1.1 列出集合
+#### 5.1.1 列出集合
 
 **使用场景**：管理界面集合列表；脚本盘点现有配置。
 
@@ -326,7 +344,7 @@ GET /admin/collections
 | `created_at` | time | 创建时间 |
 | `updated_at` | time | 最近更新时间 |
 
-#### 4.1.2 创建集合
+#### 5.1.2 创建集合
 
 **使用场景**：新建一组目标的编排容器。
 
@@ -349,7 +367,7 @@ POST /admin/collections
 
 **响应** `201` + `Collection` 实体。
 
-#### 4.1.3 查询集合
+#### 5.1.3 查询集合
 
 **使用场景**：读取单个集合的元数据。
 
@@ -363,7 +381,7 @@ GET /admin/collections/{name}
 
 **响应** `200` + `Collection` 实体（裸返，无包装）。
 
-#### 4.1.4 修改备注
+#### 5.1.4 修改备注
 
 **使用场景**：只改备注。**注意**：此端点不做集合改名。
 
@@ -385,7 +403,7 @@ PUT /admin/collections/{name}
 
 **响应** `204`（无体）。集合不存在 → `404`。
 
-#### 4.1.5 删除集合
+#### 5.1.5 删除集合
 
 **使用场景**：下线一组编排。级联删除其下全部 Group。
 
@@ -395,13 +413,13 @@ DELETE /admin/collections/{name}
 
 **响应** `204`。被 user model 引用 → `409`，`message` 列出引用者。不存在 → `404`。
 
-### 4.2 Group 与成员
+### 5.2 Group 与成员
 
 Group 是集合内的有序编组，`position` 决定顺序。
 
-#### 4.2.1 列出组
+#### 5.2.1 列出组
 
-**使用场景**：查看某集合的编组与成员引用。不含目录属性——需要判断引用有效性时用 [4.3 快照](#43-集合快照)。
+**使用场景**：查看某集合的编组与成员引用。不含目录属性——需要判断引用有效性时用 [5.3 快照](#53-集合快照)。
 
 ```http
 GET /admin/collections/{name}/groups
@@ -424,7 +442,7 @@ GET /admin/collections/{name}/groups
 | `config` | 任意 JSON 值 | 恒有 | 组级参数，原样透传给策略（服务不解析、不校验形状）；写入缺省或空归一为 `{}`，惯例用 object |
 | `members` | `array<string>` | 恒有 | 成员 `model_id` 引用列表，按组内 position 序 |
 
-#### 4.2.2 创建组
+#### 5.2.2 创建组
 
 **使用场景**：在集合内新增编组（如新增一个备用组）。
 
@@ -449,7 +467,7 @@ POST /admin/collections/{name}/groups
 
 **响应** `201` + `Group` 实体。集合不存在 → `404`。
 
-#### 4.2.3 更新组
+#### 5.2.3 更新组
 
 **使用场景**：改组的类型、排序位置或配置。
 
@@ -476,7 +494,7 @@ PUT /admin/collections/{name}/groups/{group}
 
 **响应** `204`。集合或组不存在 → `404`；`type` 缺失 → `400`。
 
-#### 4.2.4 删除组
+#### 5.2.4 删除组
 
 **使用场景**：移除编组（连同其成员引用）。
 
@@ -486,7 +504,7 @@ DELETE /admin/collections/{name}/groups/{group}
 
 **响应** `204`。不存在 → `404`。
 
-#### 4.2.5 整组替换成员
+#### 5.2.5 整组替换成员
 
 **使用场景**：维护组内目标清单与顺序。**整体替换**语义：提交列表即最终列表。
 
@@ -510,7 +528,7 @@ PUT /admin/collections/{name}/groups/{group}/members
 
 **响应** `204`。集合或组不存在 → `404`。
 
-### 4.3 集合快照
+### 5.3 集合快照
 
 **使用场景**：判断成员引用是否仍然有效（`groups` 端点只返回引用字符串，无从判断）。这是策略输入与调度过滤共用的视图：成员已叠加 upstream 目录属性。
 
@@ -541,11 +559,11 @@ GET /admin/collections/{name}/snapshot
 
 `known=false` 时目录属性字段为零值，不应读取。
 
-### 4.4 策略
+### 5.4 策略
 
 策略以脚本编写，保存时即编译；`version` 仅在 `source` 或 `language` 变化时递增（改备注不动版本——编译缓存以版本为键）。
 
-#### 4.4.1 列出策略
+#### 5.4.1 列出策略
 
 **使用场景**：管理界面策略列表。
 
@@ -570,7 +588,7 @@ GET /admin/policies
 | `note` | string | 恒有 | 备注，自由文本 |
 | `created_at` / `updated_at` | time | 恒有 | 时间戳 |
 
-#### 4.4.2 创建策略
+#### 5.4.2 创建策略
 
 **使用场景**：新增调度策略脚本。
 
@@ -593,9 +611,9 @@ POST /admin/policies
 {"name": "failover", "language": "lua", "source": "return { candidates = { \"kimi-k2-turbo\", \"ds-1/v4\" }, note = \"primary first\" }", "note": "按组顺序回退"}
 ```
 
-**响应** `201` + `Policy` 实体（`version: 1`）。脚本输入结构见 [5.3](#53-策略脚本输入)。
+**响应** `201` + `Policy` 实体（`version: 1`）。脚本输入结构见 [6.3](#63-策略脚本输入)。
 
-#### 4.4.3 查询策略
+#### 5.4.3 查询策略
 
 **使用场景**：编辑器回填源码。
 
@@ -605,7 +623,7 @@ GET /admin/policies/{name}
 
 **响应** `200` + `Policy` 实体。不存在 → `404`。
 
-#### 4.4.4 更新策略
+#### 5.4.4 更新策略
 
 **使用场景**：修改脚本或备注。
 
@@ -632,7 +650,7 @@ PUT /admin/policies/{name}
 
 **响应** `200` + 更新后的 `Policy` 实体。不存在 → `404`。
 
-#### 4.4.5 删除策略
+#### 5.4.5 删除策略
 
 **使用场景**：下线策略。
 
@@ -642,7 +660,7 @@ DELETE /admin/policies/{name}
 
 **响应** `204`。被 user model 绑定 → `409`，`message` 列出全部引用者。不存在 → `404`。
 
-### 4.5 策略试运行
+### 5.5 策略试运行
 
 **使用场景**：保存前/后验证策略逻辑。读**真实**集合快照，但运行态由调用方给定——不碰真实运行态、不写缓存、不解析目标，因此不影响任何真实请求。
 
@@ -668,7 +686,7 @@ POST /admin/policies/{name}/dry-run
 | `tried_ids` | `array<string>` | 否 | 模拟的已尝试列表（恒为数组，空为 `[]`） |
 | `request_id` | string | 否 | 模拟的请求标识 |
 
-`State`（**注意**：此处 `cooling_until` 是 Unix 秒整数，与 [4.7](#47-运行态) 运行态端点的 RFC 3339 时间戳形态不同）：
+`State`（**注意**：此处 `cooling_until` 是 Unix 秒整数，与 [5.7](#57-运行态) 运行态端点的 RFC 3339 时间戳形态不同）：
 
 | 字段 | 类型 | 允许取值 / 约束 | 含义 |
 | --- | --- | --- | --- |
@@ -702,11 +720,11 @@ POST /admin/policies/{name}/dry-run
 
 **失败**：策略或集合不存在 → `404`；脚本运行错误 → `503` `policy_error`；执行超时 → `503` `policy_timeout`。
 
-### 4.6 User Model
+### 5.6 User Model
 
 User model 是对外暴露的模型名：调用方以 `name` + `client_key` 走调度面。
 
-#### 4.6.1 列出
+#### 5.6.1 列出
 
 **使用场景**：管理界面模型名列表。
 
@@ -731,7 +749,7 @@ GET /admin/user-models
 | `enabled` | bool | 恒有 | `false` 时调度面返回 `403 disabled` |
 | `created_at` / `updated_at` | time | 恒有 | 时间戳 |
 
-#### 4.6.2 创建
+#### 5.6.2 创建
 
 **使用场景**：对外发布一个模型名。
 
@@ -758,7 +776,7 @@ POST /admin/user-models
 
 **响应** `201` + `UserModel` 实体（无密钥）。
 
-#### 4.6.3 查询
+#### 5.6.3 查询
 
 **使用场景**：编辑表单回填。
 
@@ -768,7 +786,7 @@ GET /admin/user-models/{name}
 
 **响应** `200` + `UserModel` 实体（无密钥）。不存在 → `404`。
 
-#### 4.6.4 更新
+#### 5.6.4 更新
 
 **使用场景**：修改绑定、密钥或启停。
 
@@ -797,7 +815,7 @@ PUT /admin/user-models/{name}
 
 **响应** `200` + `UserModel` 实体。引用的 collection / policy 不存在 → `400`。不存在 → `404`。
 
-#### 4.6.5 删除
+#### 5.6.5 删除
 
 **使用场景**：下线模型名。
 
@@ -807,11 +825,11 @@ DELETE /admin/user-models/{name}
 
 **响应** `204`。不存在 → `404`。
 
-### 4.7 运行态
+### 5.7 运行态
 
-调度运行态（冷却 / 失败计数 / 用量）只读 + 重置：数据只经调度面的结果上报（3.4）变更。
+调度运行态（冷却 / 失败计数 / 用量）只读 + 重置：数据只经调度面的结果上报（4.3）变更。
 
-#### 4.7.1 列出运行态
+#### 5.7.1 列出运行态
 
 **使用场景**：观察各目标的健康与用量（管理界面"运行态"页）。
 
@@ -845,7 +863,7 @@ GET /admin/runtime
 | `cache_read_tokens` | int64 | 累计缓存命中读取 token |
 | `request_count` | int64 | 累计请求次数（有效上报次数） |
 
-#### 4.7.2 重置运行态
+#### 5.7.2 重置运行态
 
 **使用场景**：目标恢复后手动解除冷却（不想等冷却自然到期）。
 
@@ -861,9 +879,9 @@ DELETE /admin/runtime/{model_id}
 
 ---
 
-## 5. 附录
+## 6. 附录
 
-### 5.1 错误码表
+### 6.1 错误码表
 
 | code | HTTP | retryable | 含义 |
 | --- | --- | --- | --- |
@@ -879,7 +897,7 @@ DELETE /admin/runtime/{model_id}
 
 `retryable: true` 的三码是数据面重试决策的依据；其余重试无意义。
 
-### 5.2 跳过原因
+### 6.2 跳过原因
 
 dispatch 响应 `decision.skipped[].reason` 的取值，按过滤顺序排列：
 
@@ -892,15 +910,15 @@ dispatch 响应 `decision.skipped[].reason` 的取值，按过滤顺序排列：
 | `cooling` | 目标处于冷却期 |
 | `resolve_failed` | 向 upstream 解析目标失败，`detail` 带原因 |
 
-### 5.3 策略脚本输入
+### 6.3 策略脚本输入
 
 脚本收到的唯一入参 `input`（JSON 形态，由服务注入）：
 
 | 字段 | 类型 | 含义 |
 | --- | --- | --- |
-| `input.request` | object | 请求上下文，形态同 `RequestContext`（4.5） |
-| `input.collection` | object | 集合快照，形态同 [4.3](#43-集合快照) |
-| `input.runtime` | object | 键为 `model_id`，值为 `State`（形态同 4.5 的 `State`，`cooling_until` 为 Unix 秒） |
+| `input.request` | object | 请求上下文，形态同 `RequestContext`（5.5） |
+| `input.collection` | object | 集合快照，形态同 [5.3](#53-集合快照) |
+| `input.runtime` | object | 键为 `model_id`，值为 `State`（形态同 5.5 的 `State`，`cooling_until` 为 Unix 秒） |
 
 - `input` 结构里**没有任何凭据字段**——"策略读不到凭据"由类型定义保证，而非运行时过滤。
 - `input.runtime` 与 `input.request.tried_ids` 恒为容器（空为 `{}` / `[]`），不会是 `null`。
@@ -908,7 +926,7 @@ dispatch 响应 `decision.skipped[].reason` 的取值，按过滤顺序排列：
 - 返回的候选仍会经调度过滤（已尝试/目录消失/禁用/冷却），脚本写错也不会把流量打到坏目标上。
 - 策略输入速查内置于管理界面（frontend/ 策略编辑页侧栏）；可执行范例见 `backend/policy/examples/`。
 
-### 5.4 运行参数（环境变量）
+### 6.4 运行参数（环境变量）
 
 与本 API 行为相关的运行参数：
 
@@ -916,7 +934,7 @@ dispatch 响应 `decision.skipped[].reason` 的取值，按过滤顺序排列：
 | --- | --- | --- |
 | `MSR_COOLDOWN_THRESHOLD` | `3` | 连续失败达到该值进入冷却；`<=0` 从不冷却 |
 | `MSR_COOLDOWN_DURATION` | `1m` | 冷却时长 |
-| `MSR_POLICY_TIMEOUT` | `200ms` | 策略执行超时（3.3 / 4.5 的 `policy_timeout`） |
+| `MSR_POLICY_TIMEOUT` | `200ms` | 策略执行超时（4.2 / 5.5 的 `policy_timeout`） |
 | `MSR_CACHE_TTL` | 见 config | Redis 读缓存 TTL |
 
 连接类变量（`MSR_PG_DSN` / `MSR_REDIS_ADDR` / `MSR_REDIS_PASSWORD` / `MSR_REDIS_DB` / `MSR_DISPATCH_KEY` / `MSR_ADMIN_KEY` / `MSR_UPSTREAM_BASE_URL` / `MSR_UPSTREAM_DELIVERY_KEY` / `MSR_LISTEN`）见根 [README.md](../README.md)。
