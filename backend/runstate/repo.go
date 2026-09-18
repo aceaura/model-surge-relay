@@ -151,26 +151,72 @@ func applyOutcome(ctx context.Context, tx pgx.Tx, rep ResultReport, cfg Threshol
 			rep.ModelID, rep.Usage.InputTokens, rep.Usage.OutputTokens, rep.Usage.CacheReadTokens)
 		return err
 	default:
-		// 失败类：递增计数，达阈值置入冷却。
-		// GREATEST 保证冷却时间只向后推进，重叠上报不会缩短既有冷却。
-		threshold := cfg.FailureThreshold
-		if threshold <= 0 {
-			threshold = 0 // 0 = 从不冷却，下面的 CASE 恒不成立
+		// 失败类分两条路径。刻意不合成一条带 CASE 的 SQL：启发式那条要看
+		// consecutive_failures + 1 >= threshold，上游明示那条不看，两套判定
+		// 塞进一个 CASE 会互相污染，而两条各自读得懂比一条聪明的 SQL 重要。
+		if trustworthyReset(rep.RetryAfter, time.Now()) {
+			return applyExplicitReset(ctx, tx, rep)
 		}
-		_, err := tx.Exec(ctx,
-			`INSERT INTO target_runtime (model_id, consecutive_failures, cooling_until, updated_at)
-			 VALUES ($1, 1, CASE WHEN $2 > 0 AND 1 >= $2 THEN now() + $3::interval ELSE NULL END, now())
-			 ON CONFLICT (model_id) DO UPDATE SET
-			   consecutive_failures = target_runtime.consecutive_failures + 1,
-			   cooling_until = CASE
-			     WHEN $2 > 0 AND target_runtime.consecutive_failures + 1 >= $2
-			       THEN GREATEST(coalesce(target_runtime.cooling_until, now()), now() + $3::interval)
-			     ELSE target_runtime.cooling_until
-			   END,
-			   updated_at = now()`,
-			rep.ModelID, threshold, intervalArg(cfg.CooldownDuration))
-		return err
+		return applyHeuristicCooldown(ctx, tx, rep, cfg)
 	}
+}
+
+// applyExplicitReset 按上游明示的到期时刻冷却，不看失败阈值。
+//
+// 失败计数照样递增：明示的冷却解除后，一个反复限流的目标应当仍被启发式
+// 逐步压制，否则它会在每个窗口开头被反复选中。
+//
+// GREATEST 保证只向后推进——重叠上报不该缩短既有冷却。
+func applyExplicitReset(ctx context.Context, tx pgx.Tx, rep ResultReport) error {
+	_, err := tx.Exec(ctx,
+		`INSERT INTO target_runtime (model_id, consecutive_failures, cooling_until, updated_at)
+		 VALUES ($1, 1, $2::timestamptz, now())
+		 ON CONFLICT (model_id) DO UPDATE SET
+		   consecutive_failures = target_runtime.consecutive_failures + 1,
+		   cooling_until = GREATEST(coalesce(target_runtime.cooling_until, now()), $2::timestamptz),
+		   updated_at = now()`,
+		rep.ModelID, rep.RetryAfter)
+	return err
+}
+
+// applyHeuristicCooldown 是上游没说到期时刻时的原有行为：
+// 递增计数，达阈值按配置时长冷却。
+func applyHeuristicCooldown(ctx context.Context, tx pgx.Tx, rep ResultReport, cfg Thresholds) error {
+	threshold := cfg.FailureThreshold
+	if threshold <= 0 {
+		threshold = 0 // 0 = 从不冷却，下面的 CASE 恒不成立
+	}
+	_, err := tx.Exec(ctx,
+		`INSERT INTO target_runtime (model_id, consecutive_failures, cooling_until, updated_at)
+		 VALUES ($1, 1, CASE WHEN $2 > 0 AND 1 >= $2 THEN now() + $3::interval ELSE NULL END, now())
+		 ON CONFLICT (model_id) DO UPDATE SET
+		   consecutive_failures = target_runtime.consecutive_failures + 1,
+		   cooling_until = CASE
+		     WHEN $2 > 0 AND target_runtime.consecutive_failures + 1 >= $2
+		       THEN GREATEST(coalesce(target_runtime.cooling_until, now()), now() + $3::interval)
+		     ELSE target_runtime.cooling_until
+		   END,
+		   updated_at = now()`,
+		rep.ModelID, threshold, intervalArg(cfg.CooldownDuration))
+	return err
+}
+
+// maxResetHorizon 与数据面 codec/ratelimit 的同名常量一致。
+//
+// 两处各有一份而不共享：两个服务独立发版、不跨仓 import（与 relayv1 镜像
+// 契约同理由）。接收侧必须自己判一次——数据面校验过的时刻在到达这里时
+// 已经过了排队与网络往返。
+const maxResetHorizon = 24 * time.Hour
+
+// trustworthyReset 判断上报来的到期时刻是否可采信。
+//
+// 过去的时刻、零值、过于遥远的时刻都是坏数据：采信一个半年后的时刻
+// 会把可用目标锁到下个季度。
+func trustworthyReset(t, now time.Time) bool {
+	if t.IsZero() || !t.After(now) {
+		return false
+	}
+	return !t.After(now.Add(maxResetHorizon))
 }
 
 // Reset 解除冷却并清零失败计数，保留累计用量（用量是审计数据，不该被运维操作抹掉）。

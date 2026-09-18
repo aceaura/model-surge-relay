@@ -534,6 +534,45 @@ func TestReportForwardsToRunState(t *testing.T) {
 	}
 }
 
+// TestReportForwardsRetryAfter 上游明示的到期时刻必须穿过契约映射。
+//
+// 单列一条而不并入上一条：那条用的是 normal 上报，而到期时刻只在失败上报上
+// 出现。这一层是纯字段搬运，断掉之后 runstate 与 codec 两侧的测试仍然全绿，
+// 而整条链路已经失效——所以它必须有自己的断言。
+func TestReportForwardsRetryAfter(t *testing.T) {
+	h := newHarness(t, boundUserModel(), twoGroupSnapshot())
+	h.runStates.applied = true
+	at := time.Now().Add(30 * time.Minute).UTC()
+
+	if _, err := h.svc.Report(context.Background(), relayv1.ResultReport{
+		ReportID: "rep-1", RequestID: "req-1", ModelID: "kimi-1/k3",
+		Outcome: string(runstate.OutcomeRetrying), RetryAfter: at,
+	}); err != nil {
+		t.Fatalf("report: %v", err)
+	}
+
+	if got := h.runStates.applyIn.RetryAfter; !got.Equal(at) {
+		t.Fatalf("forwarded RetryAfter = %v, want %v", got, at)
+	}
+}
+
+// TestReportForwardsZeroRetryAfter 上游没说时不能凭空造出一个时刻。
+func TestReportForwardsZeroRetryAfter(t *testing.T) {
+	h := newHarness(t, boundUserModel(), twoGroupSnapshot())
+	h.runStates.applied = true
+
+	if _, err := h.svc.Report(context.Background(), relayv1.ResultReport{
+		ReportID: "rep-1", RequestID: "req-1", ModelID: "kimi-1/k3",
+		Outcome: string(runstate.OutcomeAbnormal),
+	}); err != nil {
+		t.Fatalf("report: %v", err)
+	}
+
+	if got := h.runStates.applyIn.RetryAfter; !got.IsZero() {
+		t.Fatalf("forwarded RetryAfter = %v，没给就该是零值", got)
+	}
+}
+
 func TestReportDuplicateReturnsNotApplied(t *testing.T) {
 	h := newHarness(t, boundUserModel(), twoGroupSnapshot())
 	h.runStates.applied = false

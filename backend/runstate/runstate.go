@@ -69,6 +69,12 @@ type ResultReport struct {
 	ModelID   string  `json:"model_id"`
 	Outcome   Outcome `json:"outcome"`
 	Usage     Usage   `json:"usage,omitempty"`
+	// RetryAfter 是上游明示的该目标最早可重试时刻，零值表示上游没说。
+	//
+	// validate 刻意不校验它：跨进程有排队与网络往返，一个到达时已经过期的
+	// 时刻不该让整条上报被拒——上报本身是有效的，只是这一维不可用。
+	// 可信性在 applyOutcome 里判，不可信就回落启发式。
+	RetryAfter time.Time `json:"retry_after,omitzero"`
 }
 
 func (rep ResultReport) validate() error {

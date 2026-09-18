@@ -4,6 +4,7 @@ package relayv1
 import (
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/aceaura/model-surge-relay/backend/upstreamclient"
 )
@@ -123,6 +124,14 @@ type ResultReport struct {
 	ModelID   string `json:"model_id"`
 	Outcome   string `json:"outcome"`
 	Usage     Usage  `json:"usage,omitempty"`
+	// RetryAfter 是上游明示的该目标最早可重试时刻（数据面从限流响应头或
+	// google.rpc.RetryInfo 解出）。
+	//
+	// 零值（键不出现）表示上游没说，回落到失败计数启发式。非零时直接冷却
+	// 到该时刻，不要求失败计数达阈值：上游的明示比启发式可靠。
+	//
+	// omitzero 是必需的：旧版本数据面不带这个键，不能因此拒收上报。
+	RetryAfter time.Time `json:"retry_after,omitzero"`
 }
 
 type ReportResponse struct {

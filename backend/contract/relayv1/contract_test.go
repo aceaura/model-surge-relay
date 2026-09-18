@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aceaura/model-surge-relay/backend/upstreamclient"
 )
@@ -201,6 +202,56 @@ func TestResultReportRoundTrip(t *testing.T) {
 	}
 	if got != want {
 		t.Fatalf("round trip = %+v, want %+v", got, want)
+	}
+}
+
+// TestResultReportAcceptsLegacyPayload 旧版数据面不带 retry_after，不能因此拒收。
+//
+// 契约只增字段不改语义：一个没有这一维的上报仍然完整有效，
+// 调度层回落到自己的失败计数启发式。
+func TestResultReportAcceptsLegacyPayload(t *testing.T) {
+	raw := []byte(`{"report_id":"rep-1","request_id":"req-1",
+		"model_id":"kimi-1/k3","outcome":"retrying"}`)
+	var got ResultReport
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("旧版载荷被拒：%v", err)
+	}
+	if !got.RetryAfter.IsZero() {
+		t.Fatalf("RetryAfter = %v，缺键必须是零值", got.RetryAfter)
+	}
+}
+
+// TestResultReportOmitsZeroRetryAfter 零值不能写成公元 1 年那个时刻。
+//
+// 写出去的话调度层会把它当成一个「过去的到期时刻」，
+// 虽然会被可信性闸门挡掉，但载荷里多一个恒定的垃圾键。
+func TestResultReportOmitsZeroRetryAfter(t *testing.T) {
+	raw, err := json.Marshal(ResultReport{
+		ReportID: "rep-1", ModelID: "kimi-1/k3", Outcome: "abnormal",
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(raw), "retry_after") {
+		t.Fatalf("零值也写出了键：%s", raw)
+	}
+}
+
+// TestResultReportCarriesRetryAfter 非零值必须能过网线。
+func TestResultReportCarriesRetryAfter(t *testing.T) {
+	at := time.Now().Add(30 * time.Minute).UTC().Truncate(time.Second)
+	raw, err := json.Marshal(ResultReport{
+		ReportID: "rep-1", ModelID: "kimi-1/k3", Outcome: "retrying", RetryAfter: at,
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var got ResultReport
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !got.RetryAfter.Equal(at) {
+		t.Fatalf("往返后 = %v, want %v", got.RetryAfter, at)
 	}
 }
 

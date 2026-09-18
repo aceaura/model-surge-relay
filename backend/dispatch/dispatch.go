@@ -188,6 +188,7 @@ func (s *Service) Report(ctx context.Context, rep relayv1.ResultReport) (relayv1
 			OutputTokens:    rep.Usage.OutputTokens,
 			CacheReadTokens: rep.Usage.CacheReadTokens,
 		},
+		RetryAfter: rep.RetryAfter,
 	}, s.Thresholds)
 	if err != nil {
 		return relayv1.ReportResponse{}, err
