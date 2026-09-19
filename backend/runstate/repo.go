@@ -134,6 +134,12 @@ func applyOutcome(ctx context.Context, tx pgx.Tx, rep ResultReport, cfg Threshol
 	case OutcomeContextExceeded:
 		// 请求太大不是目标的问题，连 upsert 都不做：避免凭空造出一行零值记录。
 		return nil
+	case OutcomeTransport:
+		// 数据面自己那条连接坏了，上游可能完全健康，同样零变更。
+		//
+		// 刻意与上面分成两个 case 而不合并：两者语义不同，合并之后要给
+		// 其中一个加行为时先得拆开，而那时拆的人未必知道它们为什么曾在一起。
+		return nil
 	case OutcomeNormal:
 		_, err := tx.Exec(ctx,
 			`INSERT INTO target_runtime

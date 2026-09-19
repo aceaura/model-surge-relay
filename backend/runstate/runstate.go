@@ -23,13 +23,20 @@ const (
 	OutcomeRetrying Outcome = "retrying"
 	// OutcomeInvalidModel 目标模型不可用：同样计入失败。
 	OutcomeInvalidModel Outcome = "invalid_model"
+	// OutcomeTransport 数据面的出站连接层故障：连接池里那条连接坏了，
+	// 上游可能完全健康，所以不计入失败计数、运行态零变更。
+	//
+	// 与 context_exceeded 零变更语义相同但刻意不复用它：一个是「请求太大」、
+	// 一个是「数据面的连接坏了」，合成一类会让运维分不开两种成因完全不同的故障。
+	OutcomeTransport Outcome = "transport"
 	// OutcomeContextExceeded 上下文超限：请求本身太大，与目标健康无关，零变更。
 	OutcomeContextExceeded Outcome = "context_exceeded"
 )
 
 func (o Outcome) valid() bool {
 	switch o {
-	case OutcomeNormal, OutcomeAbnormal, OutcomeRetrying, OutcomeInvalidModel, OutcomeContextExceeded:
+	case OutcomeNormal, OutcomeAbnormal, OutcomeRetrying, OutcomeInvalidModel,
+		OutcomeTransport, OutcomeContextExceeded:
 		return true
 	default:
 		return false

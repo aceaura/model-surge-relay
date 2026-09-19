@@ -610,3 +610,24 @@ func TestModelsSummarizesUserModels(t *testing.T) {
 		t.Fatalf("summary = %+v", m)
 	}
 }
+
+// TestReportAcceptsTransportOutcome 新增的 transport outcome 必须能穿过受理面。
+//
+// 这一层把字符串直接转成 runstate.Outcome，没有白名单，所以真正的风险是
+// 有人日后在这里加校验时漏掉新成员——那会让数据面的连接故障上报整条被拒，
+// 连流水都留不下。
+func TestReportAcceptsTransportOutcome(t *testing.T) {
+	h := newHarness(t, boundUserModel(), twoGroupSnapshot())
+	h.runStates.applied = true
+
+	if _, err := h.svc.Report(context.Background(), relayv1.ResultReport{
+		ReportID: "rep-1", RequestID: "req-1", ModelID: "kimi-1/k3",
+		Outcome: string(runstate.OutcomeTransport),
+	}); err != nil {
+		t.Fatalf("report: %v", err)
+	}
+
+	if got := h.runStates.applyIn.Outcome; got != runstate.OutcomeTransport {
+		t.Fatalf("转写后的 outcome = %q，要 %q", got, runstate.OutcomeTransport)
+	}
+}

@@ -281,6 +281,7 @@ POST /v1/results
 | `abnormal` | 是 | +1 | 达阈值触发 |
 | `retrying` | 是 | +1 | 达阈值触发 |
 | `invalid_model` | 是 | +1 | 达阈值触发 |
+| `transport` | **否** | **不变** | **不变**（数据面出站连接层故障：它连接池里那条连接坏了，上游可能完全健康，不产生任何运行态记录） |
 | `context_exceeded` | **否** | **不变** | **不变**（请求太大是请求的问题，不产生任何运行态记录） |
 
 **`retry_after` 如何改变冷却判定**（只作用于上表中的失败类 outcome）：
@@ -291,7 +292,7 @@ POST /v1/results
 | 带 `retry_after` 但已有更晚的冷却 | 保留更晚的那个（只向后推进） | 照样 +1 |
 | 不带 `retry_after` | 达阈值后按 `MSR_COOLDOWN_DURATION` | +1 |
 | `retry_after` 不可信（过去的时刻 / 超出当下 24 小时） | **回落到启发式**（不是忽略本次失败） | +1 |
-| `outcome` 为 `normal` 或 `context_exceeded` | 忽略该字段 | 见上表 |
+| `outcome` 为 `normal`、`transport` 或 `context_exceeded` | 忽略该字段 | 见上表 |
 
 几点定死的语义：
 
