@@ -534,6 +534,35 @@ func TestReportForwardsToRunState(t *testing.T) {
 	}
 }
 
+// TestReportDoesNotAccumulateUnpricedUsage 契约收下五位，运行态只累前三位。
+//
+// 这条把一个刻意决定钉成断言：缓存写入与推理的单价与输入输出不同（1h 缓存写入
+// 约为 5m 的两倍），把它们加进同一组累计列等于用错的权重记账，而正确加权需要
+// 定价模型——那在 upstream 配置中心，不在这里。
+//
+// 不钉住的话下一个人看到契约有五位而运行态只累三位，会当成漏了并顺手加上，
+// 于是配额计算悄悄开始用错的权重。要改这个决定得先改这条测试，那时会读到理由。
+func TestReportDoesNotAccumulateUnpricedUsage(t *testing.T) {
+	h := newHarness(t, boundUserModel(), twoGroupSnapshot())
+	h.runStates.applied = true
+	if _, err := h.svc.Report(context.Background(), relayv1.ResultReport{
+		ReportID: "rep-unpriced", RequestID: "req-unpriced", ModelID: "kimi-1/k3",
+		Outcome: string(runstate.OutcomeNormal),
+		Usage: relayv1.Usage{
+			InputTokens: 10, OutputTokens: 20, CacheReadTokens: 5,
+			CacheWriteTokens: 40, ReasoningTokens: 50,
+		},
+	}); err != nil {
+		t.Fatalf("report: %v", err)
+	}
+	// runstate.Usage 只有三位加一个 RequestCount，所以「没漏进来」由类型保证；
+	// 这里断言的是前三位没被新两位污染（比如错手把 CacheWrite 加进 CacheRead）。
+	got := h.runStates.applyIn.Usage
+	if got.InputTokens != 10 || got.OutputTokens != 20 || got.CacheReadTokens != 5 {
+		t.Errorf("前三位被新两位污染了：%+v", got)
+	}
+}
+
 // TestReportForwardsRetryAfter 上游明示的到期时刻必须穿过契约映射。
 //
 // 单列一条而不并入上一条：那条用的是 normal 上报，而到期时刻只在失败上报上

@@ -116,6 +116,18 @@ type Usage struct {
 	InputTokens     int64 `json:"input_tokens,omitempty"`
 	OutputTokens    int64 `json:"output_tokens,omitempty"`
 	CacheReadTokens int64 `json:"cache_read_tokens,omitempty"`
+	// CacheWriteTokens 与 ReasoningTokens 是数据面算出的另外两位用量。
+	//
+	// 必须在这条契约上收下：客户端那侧确实收到了它们（anthropic 的
+	// cache_creation_input_tokens），丢掉等于让两边的账永久差额，而差额随
+	// prompt caching 使用率放大。
+	//
+	// 但 runstate 刻意只累计前三位（见 dispatch.Report 的转写）：这两位的单价与
+	// 输入输出不同（1h 缓存写入约为 5m 的两倍），直接加进同一组累计列等于用错的
+	// 权重记账，而正确加权需要定价模型——那在 upstream 配置中心。
+	// 契约有五位而运行态只累三位是刻意的，不是漏了。
+	CacheWriteTokens int64 `json:"cache_write_tokens,omitempty"`
+	ReasoningTokens  int64 `json:"reasoning_tokens,omitempty"`
 }
 
 type ResultReport struct {
