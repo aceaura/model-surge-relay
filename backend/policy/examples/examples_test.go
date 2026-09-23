@@ -2,6 +2,7 @@ package examples
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"testing"
 	"time"
@@ -40,9 +41,22 @@ func run(t *testing.T, name string, in policy.Input) policy.Decision {
 	if err != nil {
 		t.Fatalf("source: %v", err)
 	}
-	engine := policy.NewEngine(policy.NewRegistry(runtime.NewLua()), 2*time.Second)
+	lang, err := Language(name)
+	if err != nil {
+		t.Fatalf("language: %v", err)
+	}
+	var rt policy.Runtime
+	switch lang {
+	case policy.LangLua:
+		rt = runtime.NewLua()
+	case policy.LangJavaScript:
+		rt = runtime.NewJavaScript()
+	default:
+		t.Fatalf("no runtime registered for language %q", lang)
+	}
+	engine := policy.NewEngine(policy.NewRegistry(rt), 2*time.Second)
 	d, err := engine.Execute(context.Background(),
-		policy.Policy{Name: name, Language: policy.LangLua, Source: src, Version: 1}, in)
+		policy.Policy{Name: name, Language: lang, Source: src, Version: 1}, in)
 	if err != nil {
 		t.Fatalf("execute %s: %v", name, err)
 	}
@@ -53,11 +67,14 @@ func TestEveryExampleCompilesAndReturnsCandidates(t *testing.T) {
 	for _, name := range Names() {
 		t.Run(name, func(t *testing.T) {
 			d := run(t, name, fixture())
-			if len(d.Candidates) != 4 {
-				t.Fatalf("candidates = %v, want all four members", d.Candidates)
-			}
 			if d.Note == "" {
 				t.Fatal("note should explain the decision")
+			}
+			// Lua 预设在共用夹具上返回全部四名成员。JS 的 compact_overflow
+			// 按 group.type 分流，共用夹具没有 kimi/compact 组，故返回空候选，
+			// 其行为由下方专属测试用对应夹具断言。
+			if lang, _ := Language(name); lang == policy.LangLua && len(d.Candidates) != 4 {
+				t.Fatalf("candidates = %v, want all four members", d.Candidates)
 			}
 		})
 	}
@@ -186,6 +203,64 @@ func TestExamplesHandleEmptyCollection(t *testing.T) {
 				t.Fatalf("candidates = %v, want empty", d.Candidates)
 			}
 		})
+	}
+}
+
+// jsFixture 是 compact_overflow 的专属夹具：kimi 主池（窗口 256000）
+// 与 compact 压缩池（窗口 1000000），运行态留空（粘性与切换由配置顺序+冷却决定）。
+func jsFixture() policy.Input {
+	win := func(id string, w int) collection.Member {
+		return collection.Member{ModelID: id, Enabled: true, Known: true, ContextWindow: w}
+	}
+	return policy.Input{
+		Request: policy.RequestContext{UserModel: "sonnet", RequestID: "req-abc", EstTokens: 1000},
+		Collection: collection.Snapshot{Name: "c1", Groups: []collection.GroupSnapshot{
+			{Name: "kimi", Type: "kimi", Position: 0,
+				Members: []collection.Member{win("kimi-1/k3", 256000), win("kimi-2/k3", 256000)}},
+			{Name: "compact", Type: "compact", Position: 1,
+				Members: []collection.Member{win("ds-1/v4", 1000000)}},
+		}},
+		Runtime: map[string]policy.State{},
+	}
+}
+
+func TestCompactOverflowUsesPrimaryForNormalRequests(t *testing.T) {
+	d := run(t, CompactOverflow, jsFixture())
+	want := "[kimi-1/k3 kimi-2/k3]"
+	if fmt.Sprint(d.Candidates) != want {
+		t.Fatalf("candidates = %v, want %s", d.Candidates, want)
+	}
+}
+
+func TestCompactOverflowRoutesOverlongToCompact(t *testing.T) {
+	in := jsFixture()
+	in.Request.EstTokens = 300000 // 超过 kimi 窗口 256000
+	d := run(t, CompactOverflow, in)
+	want := "[ds-1/v4]"
+	if fmt.Sprint(d.Candidates) != want {
+		t.Fatalf("candidates = %v, want %s", d.Candidates, want)
+	}
+}
+
+func TestCompactOverflowTreatsZeroEstAsNormal(t *testing.T) {
+	in := jsFixture()
+	in.Request.EstTokens = 0 // 数据面没给估算，不得误判超长
+	d := run(t, CompactOverflow, in)
+	want := "[kimi-1/k3 kimi-2/k3]"
+	if fmt.Sprint(d.Candidates) != want {
+		t.Fatalf("candidates = %v, want %s", d.Candidates, want)
+	}
+}
+
+func TestCompactOverflowHonorsConfigThreshold(t *testing.T) {
+	in := jsFixture()
+	// 主池组显式阈值 500：est 1000 虽远小于 kimi 窗口，也应触发压缩池。
+	in.Collection.Groups[0].Config = json.RawMessage(`{"compact_above_tokens": 500}`)
+	in.Request.EstTokens = 1000
+	d := run(t, CompactOverflow, in)
+	want := "[ds-1/v4]"
+	if fmt.Sprint(d.Candidates) != want {
+		t.Fatalf("candidates = %v, want %s", d.Candidates, want)
 	}
 }
 

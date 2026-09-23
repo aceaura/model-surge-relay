@@ -108,7 +108,7 @@ flutter run -d windows
 
 支持 `lua` / `javascript` / `typescript`。TypeScript 经 esbuild 转 ES2015 后与 JS 共用 goja 执行路径。脚本用 `return` 返回决策。
 
-`policy/examples/` 里有五个可直接用的 Lua 范例：`preset`、`sticky`、`failover`、`round_robin`、`least_used`。
+`policy/examples/` 里有可直接套用的范例：五个 Lua（`preset`、`sticky`、`failover`、`round_robin`、`least_used`）覆盖老 replay 的固定语义，一个 JavaScript（`compact_overflow`）演示按 `group.type` 分流、用 `group.config` 传参、以及 `est_tokens` 对比 `context_window` 的超长判定（主池粘性、请求超窗时改走大窗口压缩池）。
 
 ### 输入
 
