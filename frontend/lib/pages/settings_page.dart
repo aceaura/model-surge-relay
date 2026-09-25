@@ -12,11 +12,15 @@ class SettingsPage extends StatefulWidget {
     required this.initial,
     required this.onSaved,
     this.dismissible = true,
+    this.embedded = false,
   });
 
   final Settings initial;
   final Future<void> Function(Settings) onSaved;
   final bool dismissible;
+
+  /// 嵌入侧栏内容区时不带 AppBar（外壳已有导航）；standalone（首启引导/推送路由）时保留。
+  final bool embedded;
 
   @override
   State<SettingsPage> createState() => _SettingsPageState();
@@ -76,16 +80,31 @@ class _SettingsPageState extends State<SettingsPage> {
   Widget build(BuildContext context) {
     final onboarding = !widget.initial.complete;
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('连接设置'),
-        automaticallyImplyLeading: widget.dismissible,
-      ),
-      body: Center(
-        child: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 560),
-          child: SingleChildScrollView(
-            padding: const EdgeInsets.all(24),
-            child: Column(
+      appBar: widget.embedded
+          ? null
+          : AppBar(
+              title: const Text('连接设置'),
+              automaticallyImplyLeading: widget.dismissible,
+            ),
+      body: SafeArea(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            if (widget.embedded)
+              const Padding(
+                padding: EdgeInsets.fromLTRB(28, 22, 28, 4),
+                child: Text(
+                  '连接设置',
+                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700),
+                ),
+              ),
+            Expanded(
+              child: Center(
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 560),
+                  child: SingleChildScrollView(
+                    padding: const EdgeInsets.all(24),
+                    child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
                 if (onboarding)
@@ -139,9 +158,13 @@ class _SettingsPageState extends State<SettingsPage> {
                           TextStyle(color: Theme.of(context).colorScheme.error),
                     ),
                   ),
-              ],
+                      ],
+                    ),
+                  ),
+                ),
+              ),
             ),
-          ),
+          ],
         ),
       ),
     );
