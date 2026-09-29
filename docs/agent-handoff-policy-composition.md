@@ -30,7 +30,7 @@
 | --- | --- | --- |
 | `decision.policy` / `decision.policy_version` | **移除** | `decision.collection_updated_at`（做出决策的集合配置版本，RFC 3339） |
 | `decision.note` | 保留但不再产生（组合器无说明概念） | — |
-| `decision.skipped[]` | 保留，成员粒度；新增 `detail` 恒带所属组（`group <name>`） | — |
+| `decision.skipped[]` | 保留，成员粒度；组合器产生的跳过其 `detail` 带所属组（`group <name>`），`resolve_failed` 的 `detail` 仍为解析失败原因 | — |
 | — | **新增** `decision.group_skips[]` | 整组跳过：`{group, reason: "group_exhausted", detail}`。排障时先看它——"为什么没走优先级更高的组" |
 
 ### 3. 错误码收缩
