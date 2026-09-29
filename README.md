@@ -1,6 +1,6 @@
 # model-surge-relay
 
-调度服务：把一个对外的 user model 名字，按可编程策略解析成一个具体的 upstream 目标（含凭据），交给数据面去发请求。
+调度服务：把一个对外的 user model 名字，按集合上的策略组合（优先级链 + 超长压缩托管）解析成一个具体的 upstream 目标（含凭据），交给数据面去发请求。
 
 ## 三向对接关系
 
@@ -11,12 +11,12 @@ model-surge-stream ──POST /v1/dispatch──▶ model-surge-relay ──POST
 ```
 
 - **model-surge-upstream** 是静态配置中心，只回答"某个 upstream model 长什么样"并下发凭据。本服务只读它，不写、不代理其数据面。
-- **model-surge-relay** 持有 Collection / Group / 成员三层配置、具名动态策略、user model 绑定，以及**自己的运行态**（冷却、连续失败、用量）。运行态放在本服务是因为 upstream 是静态的、不可写。
+- **model-surge-relay** 持有 Collection / Group / 成员三层配置、挂在 Collection 上的策略组合、user model 绑定，以及**自己的运行态**（冷却、连续失败、用量）。运行态放在本服务是因为 upstream 是静态的、不可写。
 - **model-surge-stream** 是数据面：拿 `dispatch` 返回的 target 直接发上游请求，请求结束后回报 `results`。
 
-一次请求的路径：鉴权 user model → 取 Collection 快照 → 取运行态 → 跑策略（**每次请求恰好一次**，不重试）→ 服务端过滤候选 → 逐个 resolve 直到成功 → 返回 target + 决策溯源。
+一次请求的路径：鉴权 user model → 取 Collection 快照 → 取运行态 → 组合器展开候选（**每次请求恰好一次**，不重试）→ 逐个 resolve 直到成功 → 返回 target + 决策溯源。
 
-策略只负责**排序**，永不解析目标。取凭据发生在脚本返回之后，因此凭据结构上无法进入脚本运行时；`policy.Input` 里没有任何凭据字段，这一点由一个反射测试守住。
+组合器只负责**展开有序候选**，永不解析目标。取凭据发生在组合器返回之后，凭据结构上无法进入决策逻辑。
 
 ## 环境变量
 
@@ -31,7 +31,6 @@ model-surge-stream ──POST /v1/dispatch──▶ model-surge-relay ──POST
 | `MSR_REDIS_PASSWORD` | 否 | 空 | |
 | `MSR_REDIS_DB` | 否 | `0` | |
 | `MSR_CACHE_TTL` | 否 | `1m` | 缓存兜底过期时间 |
-| `MSR_POLICY_TIMEOUT` | 否 | `200ms` | 单次策略执行超时，超时按可重试错误上报 |
 | `MSR_COOLDOWN_THRESHOLD` | 否 | `3` | 连续失败达到该值进入冷却；`0` 表示永不冷却 |
 | `MSR_COOLDOWN_DURATION` | 否 | `1m` | 冷却时长 |
 | `MSR_LISTEN` | 否 | `:8080` | 监听地址 |
@@ -78,17 +77,18 @@ docker compose up -d --build
 - Collection：`GET|POST /admin/collections`、`GET|PUT|DELETE /admin/collections/{name}`
 - Group：`GET|POST /admin/collections/{name}/groups`、`PUT|DELETE /admin/collections/{name}/groups/{group}`
 - 成员：`PUT /admin/collections/{name}/groups/{group}/members`（整组替换）
-- 策略：`GET|POST /admin/policies`、`GET|PUT|DELETE /admin/policies/{name}`
-- 试运行：`POST /admin/policies/{name}/dry-run`
+- 策略组合：`GET|PUT /admin/collections/{name}/strategy`
+- 试运行：`POST /admin/collections/{name}/strategy/dry-run`
+- 脚本策略迁移：`POST /admin/migrate-policies`（一次性，可重复执行）
 - User model：`GET|POST /admin/user-models`、`GET|PUT|DELETE /admin/user-models/{name}`
 - 运行态：`GET /admin/runtime`、`DELETE /admin/runtime/{model_id...}`
 
 几条约束：
 
-- Group 的 `type` 与 `name` 是数据库里的自由文本，不是代码枚举；策略脚本按业务语义读取，服务本身不解释。
-- 策略保存时即编译，编译失败带行列号返回 400。`version` 只在 `source` 或 `language` 真的变化时递增，改备注不动版本。
-- 被 user model 绑定的策略删不掉，返回 409 并列出全部引用者。
-- `dry-run` 读真实 Collection 快照，但运行态由调用方给定，不碰真实运行态、不解析目标。
+- Group 的 `type` 与 `name` 是数据库里的自由文本，不是代码枚举；服务本身不解释。
+- 策略组合挂在 Collection 上：`priority_chain` 是有序组链（空 = 按组 position 顺序），`overflow` 是超长压缩托管（开关 + 触发阈值 + 压缩组列表）。链与压缩组引用的组必须存在，写入即校验。
+- 被策略组合引用的组删不掉，返回 409 并指出引用位置（`priority_chain` / `compact_groups`）。
+- `dry-run` 读真实 Collection 快照与真实运行态，与调度共用同一个组合器核——看到的候选序列就是上线后的序列；它不解析目标、不写运行态。
 - `DELETE /admin/runtime/{model_id...}` 用多段通配，因为 model_id 形如 `kimi-1/k3`，含斜杠。Reset 清冷却与失败计数，但**保留用量**（那是审计数据）。
 
 ## 管理面 UI
@@ -100,83 +100,24 @@ cd frontend
 flutter run -d windows
 ```
 
-首次启动填服务地址与 `MSR_ADMIN_KEY`，之后记在本机。四个页面分别管：集合与组成员编排、策略（含试运行）、对外模型名、运行态。
+首次启动填服务地址与 `MSR_ADMIN_KEY`，之后记在本机。三个页面分别管：集合（组成员编排 + 策略组合 + 试运行）、对外模型名、运行态。
 
 细节与几处反直觉的语义见 `frontend/README.md`。
 
-## 策略编写
+## 策略组合
 
-支持 `lua` / `javascript` / `typescript`。TypeScript 经 esbuild 转 ES2015 后与 JS 共用 goja 执行路径。脚本用 `return` 返回决策。
+策略不是脚本，而是挂在 Collection 上的两组配置，由内置组合器展开成候选序列：
 
-`policy/examples/` 里有可直接套用的范例：五个 Lua（`preset`、`sticky`、`failover`、`round_robin`、`least_used`）覆盖老 replay 的固定语义，一个 JavaScript（`compact_overflow`）演示按 `group.type` 分流、用 `group.config` 传参、以及 `est_tokens` 对比 `context_window` 的超长判定（主池粘性、请求超窗时改走大窗口压缩池）。
+- **优先级链**（`priority_chain`）：有序组链。按链逐组展开候选；组内成员全部不可用（已试过 / 目录消失 / 未启用 / 冷却中，含限额冷却）时整组跳过并记录 `group_skips`，自动落到下一组。链为空 = 按组的 position 顺序展开。限额不做主动配额账本：上游限流经结果上报转化为冷却，被动参与"整组不可用"判定。
+- **超长压缩托管**（`overflow`）：开关 + 触发阈值（`threshold_tokens`）+ 压缩组列表（`compact_groups`）。请求的 `est_tokens` 达到阈值时，先展开压缩组作为 `compact` 段（数据面对其发压缩请求），再展开链作为 `resume` 段（压缩完成后回落继续原任务）；未触发时只有 `standard` 段。
 
-### 输入
+候选是**阶段化**的：`decision.candidates[]` 每项带 `phase`（`standard` / `compact` / `resume`），数据面按序执行、不问语义。决策溯源含 `collection_updated_at`（做出决策的配置版本）、`group_skips`（整组跳过）与 `skipped`（成员粒度跳过及原因）。
 
-全局变量 `input`（JS 里是函数参数 `input`）：
+试运行（`POST /admin/collections/{name}/strategy/dry-run`）与真实调度共用同一个组合器核：输入 `est_tokens` 与 `tried_ids`，输出同形态的 Decision，不解析目标、不写运行态。
 
-```jsonc
-{
-  "request": {
-    "user_model": "sonnet-pool",
-    "inbound_protocol": "anthropic",   // anthropic | chat_completions | responses | gemini
-    "est_tokens": 12000,
-    "tried_ids": [],                    // 本次请求已试过的目标，应当排除
-    "request_id": "..."
-  },
-  "collection": {
-    "name": "...",
-    "groups": [                          // 已按 position 排好序
-      {
-        "name": "primary", "type": "...", "position": 0,
-        "config": {},                    // 组自定义配置，服务不解释
-        "members": [
-          {
-            "model_id": "kimi-1/k3", "account": "kimi-1", "provider_id": "...",
-            "protocol": "anthropic", "native_model": "k3", "context_window": 262144,
-            "enabled": true,
-            "known": true,               // false = 该引用在 upstream 目录中已消失
-            "position": 0
-          }
-        ]
-      }
-    ]
-  },
-  "runtime": {
-    "kimi-1/k3": {
-      "cooling": false, "cooling_until": 0,
-      "consecutive_failures": 0,
-      "input_tokens": 0, "output_tokens": 0, "request_count": 0
-    }
-  }
-}
-```
+### 从脚本策略迁移
 
-`runtime` 与 `tried_ids` 恒为容器而非 `null`，`groups` / `members` 同理，所以脚本可以直接索引和遍历。
-
-### 输出
-
-两种形态都接受：
-
-```lua
-return { "kimi-1/k3", "ark-2/doubao" }                        -- 纯候选数组
-return { candidates = {...}, note = "为什么这么排" }            -- 带说明
-```
-
-`note` 会原样出现在 `decision.note` 里，便于线上溯源。
-
-### 服务端过滤是兜底，不是替代
-
-脚本返回后，服务端按固定优先级丢弃候选，并把每一条记进 `decision.skipped`：不在 Collection 内 → 已试过 → 目录中不存在 → 已禁用 → 正在冷却。也就是说脚本刻意返回一个冷却中的目标依然会被拒；这层是保险，正确的冷却判断仍应写在脚本里。
-
-候选全被过滤时直接返回 `target_unavailable`，不会去 resolve。
-
-### 沙箱
-
-- 不装 `io` / `os` / `package` / `debug`；`base` 库里的 `load` / `loadfile` / `dofile` / `require` / `print` 也逐一摘掉。JS 侧不注入任何宿主对象。
-- 没有文件、网络、进程环境与动态加载能力。
-- 编译一次多次执行，每次执行新建解释器，执行之间不共享可变状态。
-- 超时由 ctx 控制；Lua 另有 2000 万条指令上限，让无系统调用的死循环更快中断。
-- panic 被 recover，映射为策略错误（不可重试）；超时映射为可重试。
+旧版 Lua/JS 脚本策略已整体下线。`POST /admin/migrate-policies` 执行一次性迁移：按 user model 的绑定关系把具名脚本映射为集合上的组合配置（`failover`/`sticky`/`preset`/`round_robin`/`least_used` → 优先级链按组顺序；`compact_overflow` → 主池链 + 压缩托管，阈值取组 `config.compact_above_tokens`、其次主池成员最大 `context_window`）。同一集合被多个脚本引用时取多数，冲突与无法映射的脚本进报告人工跟进。迁移幂等，可重复执行；`policies` 表与 `user_models.policy` 列物理保留供反查，确认无遗留后人工 DROP。
 
 ## 测试
 

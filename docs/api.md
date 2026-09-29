@@ -6,7 +6,7 @@
 | API 版本 | `v1`（契约定义：`backend/contract/relayv1`） |
 | 基准地址 | `http://<host>:8081`（compose 默认宿主映射 8081） |
 | 内容类型 | 请求与响应体均为 `application/json; charset=utf-8`；`204` 端点无响应体 |
-| 时间格式 | RFC 3339 UTC，如 `2026-09-16T10:04:02.448393Z`（例外：dry-run 的 `cooling_until` 为 Unix 秒，见 5.5） |
+| 时间格式 | RFC 3339 UTC，如 `2026-09-16T10:04:02.448393Z` |
 
 ## 目录
 
@@ -16,7 +16,7 @@
 - [4. 调度面 API](#4-调度面-api)
   - [4.1 模型列表](#41-模型列表) · [4.2 调度](#42-调度) · [4.3 结果上报](#43-结果上报)
 - [5. 管理面 API](#5-管理面-api)
-  - [5.1 Collection](#51-collection) · [5.2 Group 与成员](#52-group-与成员) · [5.3 集合快照](#53-集合快照) · [5.4 策略](#54-策略) · [5.5 策略试运行](#55-策略试运行) · [5.6 User Model](#56-user-model) · [5.7 运行态](#57-运行态)
+  - [5.1 Collection](#51-collection) · [5.2 Group 与成员](#52-group-与成员) · [5.3 集合快照](#53-集合快照) · [5.4 策略组合](#54-策略组合) · [5.5 策略组合试运行](#55-策略组合试运行) · [5.6 User Model](#56-user-model) · [5.7 运行态](#57-运行态) · [5.8 脚本策略迁移](#58-脚本策略迁移)
 - [6. 附录](#6-附录)
 
 ---
@@ -26,7 +26,7 @@
 本服务是 ModelSurge 的调度面。调用方分两类：
 
 - **数据面**（model-surge-stream）：在每次客户端请求前调用调度接口选出目标，调用结束后回报结果。设计目标是"凭据不出调度链路"——数据面拿到的是已解析的连接信息，回流的只有用量与结果类别。
-- **运维面**（人与 [frontend/](../frontend/) 管理界面）：维护 Collection / Group / 策略 / User Model 四层配置，观察与干预运行态。
+- **运维面**（人与 [frontend/](../frontend/) 管理界面）：维护 Collection（含策略组合）/ Group / User Model 三层配置，观察与干预运行态。
 
 静态配置（账号、上游模型、凭据）托管在 model-surge-upstream，本服务只读消费其下发面；运行态（冷却、失败计数、用量）是本服务的私有状态，**只能**经调度面的结果上报变更。
 
@@ -87,7 +87,7 @@ Authorization: Bearer <密钥>
 
 ### 2.4 命名与路径
 
-- 名称（collection / group / policy / user model）服务端仅要求非空；**含 `/` 的名称无法作为 URL 路径段寻址**，建议 `[a-z0-9._-]`。
+- 名称（collection / group / user model）服务端仅要求非空；**含 `/` 的名称无法作为 URL 路径段寻址**，建议 `[a-z0-9._-]`。
 - 唯一例外：runtime 的 `model_id`（形如 `ds-1/v4`）含斜杠，按多段路径传递，无需编码。
 - 其余含特殊字符的路径段按常规 percent-encoding 编码。
 
@@ -147,13 +147,12 @@ GET /v1/models
 | 字段 | 类型 | 出现条件 | 取值 / 含义 |
 | --- | --- | --- | --- |
 | `name` | string | 恒有 | 对外模型名，作为 4.2 `model` 的取值 |
-| `collection` | string | 恒有 | 所属集合名 |
-| `policy` | string | 绑定了策略时 | 策略名；**缺省 = 走兜底顺序**（组顺序展平） |
+| `collection` | string | 恒有 | 所属集合名（调度策略组合挂在集合上） |
 | `protocol` | string | 配置了约束时 | 期望入站协议；**缺省 = 不限** |
 | `enabled` | bool | 恒有 | 此端点恒为 `true` |
 
 ```json
-{"models": [{"name": "demo-pool", "collection": "demo", "policy": "failover", "protocol": "anthropic", "enabled": true}]}
+{"models": [{"name": "demo-pool", "collection": "demo", "protocol": "anthropic", "enabled": true}]}
 ```
 
 ### 4.2 调度
@@ -173,7 +172,7 @@ POST /v1/dispatch
 | `inbound_protocol` | string | 否 | `anthropic` \| `chat_completions` \| `responses` \| `gemini` | 入站协议。user model 配置了 `protocol` 且与此不符 → `400`（`field: inbound_protocol`）；两者任一为空则不校验 |
 | `request_id` | string | 否 | 任意字符串 | 调用方请求标识；原样回显并写日志，用于链路对账 |
 | `tried_ids` | `array<string>` | 否 | 目标 `model_id` 列表，重复值容忍（去重处理） | 本次会话已尝试的目标，调度时排除（跳过原因 `already_tried`） |
-| `est_tokens` | int | 否 | 任意整数，缺省 0 | 请求预估 token 数。仅作为策略脚本输入 `request.est_tokens`，服务端**不做**上下文硬过滤 |
+| `est_tokens` | int | 否 | 任意整数，缺省 0 | 请求预估 token 数。与集合策略组合的 `overflow.threshold_tokens` 比较：达到阈值触发超长压缩托管（候选分 `compact` / `resume` 两段，见 `Decision`） |
 
 ```json
 {"model": "demo-pool", "inbound_protocol": "anthropic", "client_key": "sk-demo-pool-2026", "request_id": "req-1", "tried_ids": [], "est_tokens": 8192}
@@ -208,14 +207,28 @@ POST /v1/dispatch
 
 | 字段 | 类型 | 出现条件 | 取值 / 含义 |
 | --- | --- | --- | --- |
-| `policy` | string | 绑定了策略时 | 策略名；**缺省 = 兜底顺序** |
-| `policy_version` | int | 绑定了策略时 | 执行时的策略版本号（≥1） |
 | `collection` | string | 恒有 | 本次调度读取的集合名 |
+| `collection_updated_at` | time | 恒有 | 集合配置（含策略组合）的最近更新时间，即做出本次决策的配置版本 |
 | `group` | string | 恒有 | 命中目标所属组名 |
-| `group_type` | string | 恒有 | 该组类型（自由文本，语义由策略约定） |
-| `note` | string | 策略返回时 | 策略脚本附带的说明 |
-| `candidates` | `array<string>` | 恒有 | 过滤后仍有效的候选，按优先顺序；首个即 `target` |
-| `skipped` | `array<Skip>` | 恒有 | 被丢弃的候选及原因；可能为空数组 |
+| `group_type` | string | 恒有 | 该组类型（自由文本，服务不解释） |
+| `candidates` | `array<PhasedCandidate>` | 恒有 | 阶段化候选，按执行顺序；首个即 `target` |
+| `group_skips` | `array<GroupSkip>` | 有整组跳过时 | 被整组跳过的组及原因 |
+| `skipped` | `array<Skip>` | 有成员被丢弃时 | 被丢弃的成员及原因 |
+
+`PhasedCandidate`：
+
+| 字段 | 类型 | 取值 / 含义 |
+| --- | --- | --- |
+| `model_id` | string | 候选目标 |
+| `phase` | string | 执行阶段，封闭集合：`standard`（未触发超长时的唯一段）/ `compact`（压缩组托管段，数据面对其发压缩请求）/ `resume`（压缩完成后回落继续原任务的段）。**按序执行、不问语义**；同一目标允许同时出现在 `compact` 与 `resume` 两段 |
+
+`GroupSkip`：
+
+| 字段 | 类型 | 出现条件 | 取值 / 含义 |
+| --- | --- | --- | --- |
+| `group` | string | 恒有 | 被跳过的组名 |
+| `reason` | string | 恒有 | 恒为 `group_exhausted`：组内成员全部不可用（含限额冷却——限额是被动的，靠上游限流上报转化为冷却参与判定） |
+| `detail` | string | 有补充信息时 | 如 `all 3 members unavailable` |
 
 `Skip`：
 
@@ -223,7 +236,7 @@ POST /v1/dispatch
 | --- | --- | --- | --- |
 | `model_id` | string | 恒有 | 被丢弃的候选 |
 | `reason` | string | 恒有 | 封闭集合，见 [6.2](#62-跳过原因) |
-| `detail` | string | `reason=resolve_failed` 时 | 解析失败的底层原因（不含凭据） |
+| `detail` | string | 有补充信息时 | 成员跳过时为该成员所属组（`group <name>`）；`reason=resolve_failed` 时为解析失败的底层原因（不含凭据） |
 
 ```json
 {
@@ -237,10 +250,18 @@ POST /v1/dispatch
     "overrides": {}
   },
   "decision": {
-    "policy": "failover", "policy_version": 2, "collection": "demo",
-    "group": "primary", "group_type": "fast", "note": "group-by-group failover",
-    "candidates": ["kimi-k2-turbo", "ds-1/v4", "ds-1/v4-thinking"],
-    "skipped": []
+    "collection": "demo", "collection_updated_at": "2026-09-29T08:00:00Z",
+    "group": "primary", "group_type": "fast",
+    "candidates": [
+      {"model_id": "kimi-k2-turbo", "phase": "standard"},
+      {"model_id": "ds-1/v4", "phase": "standard"}
+    ],
+    "group_skips": [
+      {"group": "premium", "reason": "group_exhausted", "detail": "all 2 members unavailable"}
+    ],
+    "skipped": [
+      {"model_id": "ds-1/v4-thinking", "reason": "cooling", "detail": "group premium"}
+    ]
   }
 }
 ```
@@ -249,10 +270,8 @@ POST /v1/dispatch
 
 | 场景 | 状态码 / code | retryable |
 | --- | --- | --- |
-| 候选全部被过滤（无可用目标） | `503` `target_unavailable` | 是 |
+| 无可用候选（全部组被跳过或成员全被过滤） | `503` `target_unavailable` | 是 |
 | 候选全部解析失败 | `503` `target_unavailable` | 是 |
-| 策略脚本运行出错 | `503` `policy_error` | **否**（脚本 bug，重试必然再失败） |
-| 策略执行超时（默认 200ms，`MSR_POLICY_TIMEOUT` 可调） | `503` `policy_timeout` | 是 |
 
 ### 4.3 结果上报
 
@@ -334,7 +353,7 @@ POST /v1/results
 - **列表端点解包装**（`{"<资源复数>": [...]}`）；**单体端点裸返实体**。
 - 创建成功 `201` + 实体；更新类端点有的返回实体（`200`）、有的无体（`204`），各端点分别注明。
 - user model 的 `client_key` 在任何读响应中都不出现。
-- 列表排序：collections / policies / user_models / runtime 按名称（或 model_id）字典序；groups 按 `position` 升序、并列按 `name`；组内成员按组内 `position` 升序、并列按 `model_id`。
+- 列表排序：collections / user_models / runtime 按名称（或 model_id）字典序；groups 按 `position` 升序、并列按 `name`；组内成员按组内 `position` 升序、并列按 `model_id`。
 
 ### 5.1 Collection
 
@@ -458,9 +477,9 @@ GET /admin/collections/{name}/groups
 | --- | --- | --- | --- |
 | `collection` | string | 恒有 | 所属集合名 |
 | `name` | string | 恒有 | 组名，集合内唯一 |
-| `type` | string | 恒有 | 组类型，**自由文本**（如 `fast` / `cheap`），语义由策略脚本约定，服务不解释；创建时须非空 |
+| `type` | string | 恒有 | 组类型，**自由文本**（如 `fast` / `cheap` / `compact`），服务不解释；创建时须非空。迁移器按 `compact` 类型识别压缩组（见 [5.8](#58-脚本策略迁移)） |
 | `position` | int | 恒有 | 排序键，任意整数，升序生效（惯例从 0 起） |
-| `config` | 任意 JSON 值 | 恒有 | 组级参数，原样透传给策略（服务不解析、不校验形状）；写入缺省或空归一为 `{}`，惯例用 object |
+| `config` | 任意 JSON 值 | 恒有 | 组级参数（服务不解析、不校验形状，调度不消费；迁移器读 `compact_above_tokens`，见 [5.8](#58-脚本策略迁移)）；写入缺省或空归一为 `{}`，惯例用 object |
 | `members` | `array<string>` | 恒有 | 成员 `model_id` 引用列表，按组内 position 序 |
 
 #### 5.2.2 创建组
@@ -523,7 +542,7 @@ PUT /admin/collections/{name}/groups/{group}
 DELETE /admin/collections/{name}/groups/{group}
 ```
 
-**响应** `204`。不存在 → `404`。
+**响应** `204`。不存在 → `404`。被策略组合引用（出现在 `priority_chain` 或 `overflow.compact_groups` 中）→ `409`，`message` 指出引用位置——先从策略组合中移除该组再删除。
 
 #### 5.2.5 整组替换成员
 
@@ -551,7 +570,7 @@ PUT /admin/collections/{name}/groups/{group}/members
 
 ### 5.3 集合快照
 
-**使用场景**：判断成员引用是否仍然有效（`groups` 端点只返回引用字符串，无从判断）。这是策略输入与调度过滤共用的视图：成员已叠加 upstream 目录属性。
+**使用场景**：判断成员引用是否仍然有效（`groups` 端点只返回引用字符串，无从判断）。这是组合器展开候选时看到的视图：成员已叠加 upstream 目录属性。
 
 ```http
 GET /admin/collections/{name}/snapshot
@@ -580,166 +599,102 @@ GET /admin/collections/{name}/snapshot
 
 `known=false` 时目录属性字段为零值，不应读取。
 
-### 5.4 策略
+### 5.4 策略组合
 
-策略以脚本编写，保存时即编译；`version` 仅在 `source` 或 `language` 变化时递增（改备注不动版本——编译缓存以版本为键）。
+策略组合挂在 Collection 上，是内置组合器的两组配置：**优先级链**（有序组链，整组不可用时自动落到下一组）与**超长压缩托管**（`est_tokens` 达阈值时先走压缩组、压缩完成回落原链）。组合语义与阶段化候选见 [6.3](#63-策略组合语义)。
 
-#### 5.4.1 列出策略
-
-**使用场景**：管理界面策略列表。
-
-```http
-GET /admin/policies
-```
-
-**响应** `200`：
-
-| 字段 | 类型 | 含义 |
-| --- | --- | --- |
-| `policies` | `array<Policy>` | 按名称字典序 |
-
-`Policy`（策略端点共用的实体形态）：
+`Strategy`（策略组合端点共用的实体形态）：
 
 | 字段 | 类型 | 出现条件 | 取值 / 含义 |
 | --- | --- | --- | --- |
-| `name` | string | 恒有 | 策略名，主键 |
-| `language` | string | 恒有 | `lua` \| `javascript` \| `typescript`（保存时小写归一） |
-| `source` | string | 恒有 | 脚本源码原文 |
-| `version` | int | 恒有 | 版本号，≥1；source / language 变化时 +1 |
-| `note` | string | 恒有 | 备注，自由文本 |
-| `created_at` / `updated_at` | time | 恒有 | 时间戳 |
+| `priority_chain` | `array<string>` | 配置了链时 | 有序组名列表，元素须为本集合的组且不重复；**缺省 / 空 = 按组 `position` 顺序展开** |
+| `overflow` | object | 恒有 | 超长压缩托管配置，见下 |
 
-#### 5.4.2 创建策略
+`overflow`：
 
-**使用场景**：新增调度策略脚本。
-
-```http
-POST /admin/policies
-```
-
-**请求体**：
-
-| 字段 | 类型 | 必填 | 允许取值 / 约束 | 含义 |
-| --- | --- | --- | --- | --- |
-| `name` | string | 是 | 非空；全局唯一 | 策略名。重名 → `409` |
-| `language` | string | 是 | `lua` \| `javascript` \| `typescript`（大小写不敏感，自动 trim） | 脚本语言。其他值 → `400`（`field: language`，message 列出受支持集合） |
-| `source` | string | 是 | 可编译的脚本源码 | 编译失败 → `400`，`message` 带行列号，**源码不入库** |
-| `note` | string | 否 | 自由文本 | 备注 |
-
-**请求示例**：
-
-```json
-{"name": "failover", "language": "lua", "source": "return { candidates = { \"kimi-k2-turbo\", \"ds-1/v4\" }, note = \"primary first\" }", "note": "按组顺序回退"}
-```
-
-**响应** `201` + `Policy` 实体（`version: 1`）。脚本输入结构见 [6.3](#63-策略脚本输入)。
-
-#### 5.4.3 查询策略
-
-**使用场景**：编辑器回填源码。
-
-```http
-GET /admin/policies/{name}
-```
-
-**响应** `200` + `Policy` 实体。不存在 → `404`。
-
-#### 5.4.4 更新策略
-
-**使用场景**：修改脚本或备注。
-
-```http
-PUT /admin/policies/{name}
-```
-
-**请求体**：
-
-| 字段 | 类型 | 必填 | 允许取值 / 约束 | 含义 |
-| --- | --- | --- | --- | --- |
-| `name` | string | — | 忽略 | 以路径 `{name}` 为准 |
-| `language` | string | 是 | `lua` \| `javascript` \| `typescript`（大小写不敏感，自动 trim） | 脚本语言。缺失或集合外 → `400`（`field: language`，message 列出受支持集合） |
-| `source` | string | 是 | 可编译的脚本源码 | 编译失败 → `400`（`field: source`，message 带行列号），**不落任何变更** |
-| `note` | string | 否 | 自由文本；缺省空串 | 备注 |
-
-**整体替换**语义：三个字段一律以请求体为准，未提交的 `note` 会被清空。`version` 仅在 `source` 或 `language` 与旧值不同时 +1，只改 `note` 不动版本。
-
-**请求示例**：
-
-```json
-{"language": "lua", "source": "return { candidates = { \"ds-1/v4\", \"kimi-k2-turbo\" } }", "note": "新版脚本"}
-```
-
-**响应** `200` + 更新后的 `Policy` 实体。不存在 → `404`。
-
-#### 5.4.5 删除策略
-
-**使用场景**：下线策略。
-
-```http
-DELETE /admin/policies/{name}
-```
-
-**响应** `204`。被 user model 绑定 → `409`，`message` 列出全部引用者。不存在 → `404`。
-
-### 5.5 策略试运行
-
-**使用场景**：保存前/后验证策略逻辑。读**真实**集合快照，但运行态由调用方给定——不碰真实运行态、不写缓存、不解析目标，因此不影响任何真实请求。
-
-```http
-POST /admin/policies/{name}/dry-run
-```
-
-**请求体**：
-
-| 字段 | 类型 | 必填 | 允许取值 / 约束 | 含义 |
-| --- | --- | --- | --- | --- |
-| `collection` | string | 是 | 须存在的集合名 | 快照来源。不存在 → `404` |
-| `request` | object | 是 | 见 `RequestContext` 表 | 模拟的请求上下文 |
-| `runtime` | object | 否 | 键为 `model_id`，值为 `State`；缺省为空对象 | 模拟运行态（默认全部不冷却、零用量） |
-
-`RequestContext`（与 dispatch 请求的对应字段同形态）：
-
-| 字段 | 类型 | 必填 | 含义 |
+| 字段 | 类型 | 出现条件 | 取值 / 含义 |
 | --- | --- | --- | --- |
-| `user_model` | string | 否 | 模拟的模型名（脚本可读） |
-| `inbound_protocol` | string | 否 | 模拟的入站协议 |
-| `est_tokens` | int | 否 | 模拟的预估 token 数 |
-| `tried_ids` | `array<string>` | 否 | 模拟的已尝试列表（恒为数组，空为 `[]`） |
-| `request_id` | string | 否 | 模拟的请求标识 |
+| `enabled` | bool | 恒有 | 是否启用压缩托管 |
+| `threshold_tokens` | int | 启用时 | 触发阈值；`est_tokens` ≥ 该值进入压缩托管。启用时须为正整数 |
+| `compact_groups` | `array<string>` | 启用时 | 压缩组列表，元素须为本集合的组；启用时须非空 |
 
-`State`（**注意**：此处 `cooling_until` 是 Unix 秒整数，与 [5.7](#57-运行态) 运行态端点的 RFC 3339 时间戳形态不同）：
+写入校验（任一不满足 → `400`，`field` 指明出错字段）：
 
-| 字段 | 类型 | 允许取值 / 约束 | 含义 |
-| --- | --- | --- | --- |
-| `cooling` | bool | — | 是否处于冷却 |
-| `cooling_until` | int64 | Unix 秒；`0` 或缺省 = 未冷却 | 冷却截止时刻 |
-| `consecutive_failures` | int | ≥0 | 连续失败次数 |
-| `input_tokens` / `output_tokens` / `request_count` | int64 | ≥0 | 模拟用量 |
+| 情形 | `field` |
+| --- | --- |
+| 链引用未知组 / 链内重复组 | `priority_chain` |
+| 启用但阈值非正 | `threshold_tokens` |
+| 启用但压缩组为空 / 压缩组引用未知组 | `compact_groups` |
+
+#### 5.4.1 查询策略组合
+
+**使用场景**：管理界面「策略组合」编辑器回填。
+
+```http
+GET /admin/collections/{name}/strategy
+```
+
+**响应** `200` + `Strategy` 实体（裸返，无包装）。集合不存在 → `404`。
+
+#### 5.4.2 写入策略组合
+
+**使用场景**：配置或修改集合的优先级链与压缩托管。**整体替换**语义：提交的 `Strategy` 即最终配置。
+
+```http
+PUT /admin/collections/{name}/strategy
+```
+
+**请求体**：`Strategy` 实体（字段约束见上表）。
 
 **请求示例**：
 
 ```json
 {
-  "collection": "demo",
-  "request": {"user_model": "demo-pool", "inbound_protocol": "anthropic", "est_tokens": 8192, "tried_ids": [], "request_id": "req-1"},
-  "runtime": {"kimi-k2-turbo": {"cooling": true, "cooling_until": 1790000000, "consecutive_failures": 3}}
+  "priority_chain": ["premium", "standard"],
+  "overflow": {"enabled": true, "threshold_tokens": 200000, "compact_groups": ["compact-pool"]}
 }
 ```
 
-**响应** `200`：
+**响应** `204`。集合不存在 → `404`；校验失败 → `400`（`field` 见上表）。写入立即生效——下一次调度即按新组合展开。
 
-| 字段 | 类型 | 含义 |
-| --- | --- | --- |
-| `policy` | string | 策略名 |
-| `policy_version` | int | 执行的策略版本 |
-| `decision.candidates` | `array<string>` | 脚本原始输出，**未经调度过滤**（不做已尝试/冷却/启用过滤）——试运行验证的是脚本逻辑，不是调度结果 |
-| `decision.note` | string | 脚本附带的说明，可选 |
+### 5.5 策略组合试运行
 
-```json
-{"policy": "failover", "policy_version": 2, "decision": {"candidates": ["kimi-k2-turbo", "ds-1/v4", "ds-1/v4-thinking"], "note": "group-by-group failover"}}
+**使用场景**：上线前验证组合配置。读**真实**集合快照与**真实**运行态，与调度共用同一个组合器核——看到的候选序列就是上线后的序列。不解析目标、不写运行态、不写缓存，因此不影响任何真实请求。
+
+```http
+POST /admin/collections/{name}/strategy/dry-run
 ```
 
-**失败**：策略或集合不存在 → `404`；脚本运行错误 → `503` `policy_error`；执行超时 → `503` `policy_timeout`。
+**请求体**：
+
+| 字段 | 类型 | 必填 | 含义 |
+| --- | --- | --- | --- |
+| `est_tokens` | int | 否 | 模拟的预估 token 数（驱动超长判定，缺省 0） |
+| `tried_ids` | `array<string>` | 否 | 模拟的已尝试列表（跳过原因 `already_tried`） |
+
+**请求示例**：
+
+```json
+{"est_tokens": 300000, "tried_ids": ["kimi-k2-turbo"]}
+```
+
+**响应** `200`：`{"decision": <Decision>}`，`Decision` 形态同 [4.2](#42-调度)（阶段化 `candidates`、`group_skips`、`skipped` 齐全），唯 `group` / `group_type` 为空——试运行不选定目标。
+
+```json
+{
+  "decision": {
+    "collection": "demo", "collection_updated_at": "2026-09-29T08:00:00Z",
+    "candidates": [
+      {"model_id": "compact-1/c", "phase": "compact"},
+      {"model_id": "ds-1/v4", "phase": "resume"}
+    ],
+    "group_skips": [{"group": "premium", "reason": "group_exhausted", "detail": "all 2 members unavailable"}],
+    "skipped": [{"model_id": "kimi-k2-turbo", "reason": "already_tried", "detail": "group premium"}]
+  }
+}
+```
+
+**失败**：集合不存在 → `404`。
 
 ### 5.6 User Model
 
@@ -764,8 +719,7 @@ GET /admin/user-models
 | 字段 | 类型 | 出现条件 | 取值 / 含义 |
 | --- | --- | --- | --- |
 | `name` | string | 恒有 | 模型名，主键 |
-| `collection` | string | 恒有 | 所属集合 |
-| `policy` | string | 绑定时 | 策略名；缺省 = 兜底顺序 |
+| `collection` | string | 恒有 | 所属集合（调度按其策略组合展开候选） |
 | `protocol` | string | 配置时 | 入站协议约束；缺省 = 不限 |
 | `enabled` | bool | 恒有 | `false` 时调度面返回 `403 disabled` |
 | `created_at` / `updated_at` | time | 恒有 | 时间戳 |
@@ -785,14 +739,13 @@ POST /admin/user-models
 | `name` | string | 是 | 非空；全局唯一 | 模型名。重名 → `409` |
 | `collection` | string | 是 | 须存在 | 所属集合。不存在 → `400`（`field: collection`） |
 | `client_key` | string | 是 | 非空 | 调用方密钥。只在创建/更新请求体中出现，任何读响应都不返回 |
-| `policy` | string | 否 | 须存在 | 绑定策略。不存在 → `400`（`field: policy`）；缺省 = 兜底顺序 |
 | `protocol` | string | 否 | `anthropic` \| `chat_completions` \| `responses` \| `gemini` | 入站协议约束；缺省 = 不限 |
 | `enabled` | bool | 否 | 缺省 `false` | 是否启用。**创建时缺省即停用**，要立刻可用需显式 `true` |
 
 **请求示例**：
 
 ```json
-{"name": "demo-pool", "collection": "demo", "client_key": "sk-demo-pool-2026", "policy": "failover", "protocol": "anthropic", "enabled": true}
+{"name": "demo-pool", "collection": "demo", "client_key": "sk-demo-pool-2026", "protocol": "anthropic", "enabled": true}
 ```
 
 **响应** `201` + `UserModel` 实体（无密钥）。
@@ -822,19 +775,18 @@ PUT /admin/user-models/{name}
 | `name` | string | — | 忽略 | 以路径 `{name}` 为准 |
 | `collection` | string | 是 | 须存在 | 所属集合。不存在 → `400`（`field: collection`） |
 | `client_key` | string | 是 | 非空 | 新密钥。**必须重新提交**（响应从不回显旧值）；缺失或空串 → `400`（`field: client_key`） |
-| `policy` | string | 否 | 须存在，或空串 | 绑定策略；**空串 = 解绑**（改走兜底顺序）；不存在 → `400`（`field: policy`） |
 | `protocol` | string | 否 | `anthropic` \| `chat_completions` \| `responses` \| `gemini`，或空串 | 入站协议约束；**空串 = 不限** |
 | `enabled` | bool | 否 | 缺省 `false` | 是否启用。**漏提交即停用**，请显式携带 |
 
-**整体替换**语义，无"空则保留"：未提交的 `policy` / `protocol` 会被清空（解绑 / 不限）、`enabled` 归 `false`；`client_key` 旧值不回显，必须重填。
+**整体替换**语义，无"空则保留"：未提交的 `protocol` 会被清空（不限）、`enabled` 归 `false`；`client_key` 旧值不回显，必须重填。
 
 **请求示例**：
 
 ```json
-{"collection": "demo", "client_key": "sk-demo-pool-2026", "policy": "failover", "protocol": "anthropic", "enabled": true}
+{"collection": "demo", "client_key": "sk-demo-pool-2026", "protocol": "anthropic", "enabled": true}
 ```
 
-**响应** `200` + `UserModel` 实体。引用的 collection / policy 不存在 → `400`。不存在 → `404`。
+**响应** `200` + `UserModel` 实体。引用的 collection 不存在 → `400`。不存在 → `404`。
 
 #### 5.6.5 删除
 
@@ -898,6 +850,42 @@ DELETE /admin/runtime/{model_id}
 
 **响应** `204`。清零冷却与失败计数，**保留用量**（审计数据）。无该目标的运行态记录 → `404`（`"no runtime state for target ..."`）。
 
+### 5.8 脚本策略迁移
+
+**使用场景**：从已下线的脚本策略（`policies` 表 + `user_models.policy` 绑定）迁移到策略组合。一次性运维动作；幂等，可重复执行——已符合映射结果的集合会被重写为同一配置，不产生重复副作用。
+
+```http
+POST /admin/migrate-policies
+```
+
+**请求**：无请求体。
+
+**迁移规则**：按 user model 的现存绑定把具名脚本映射为所在集合的组合配置。同一集合被多个脚本引用时取多数（并列取字典序最小者）。映射关系：
+
+| 脚本名 | 迁移结果 |
+| --- | --- |
+| `failover` / `sticky` / `preset` / `round_robin` / `least_used` | `priority_chain` = 集合现有组顺序，`overflow` 关闭 |
+| `compact_overflow` | 主池（非 `compact` 类型组）入链 + `overflow` 启用；阈值取主池组 `config.compact_above_tokens`，缺省取主池成员最大 `context_window`；`compact` 类型组入 `compact_groups`。阈值无从确定时 `overflow.enabled=false` 并在报告 `note` 说明 |
+| 其他脚本名 | 写入默认链（组顺序），并入 `unmapped` 报告人工跟进 |
+
+**响应** `200`：
+
+| 字段 | 类型 | 含义 |
+| --- | --- | --- |
+| `mapped` | `array` | 已映射清单：`{collection, policy, note?}` |
+| `conflicts` | `array` | 多脚本引用冲突清单：`{collection, policies, chosen}`（`chosen` 为实际采用的脚本） |
+| `unmapped` | `array` | 无法映射、落了默认链的清单：`{collection, policy}` |
+
+```json
+{
+  "mapped": [{"collection": "demo", "policy": "compact_overflow", "note": "threshold from group config"}],
+  "conflicts": [{"collection": "c2", "policies": ["failover", "homegrown"], "chosen": "failover"}],
+  "unmapped": []
+}
+```
+
+**失败**：部署未启用迁移器 → `409`。迁移不删除 `policies` 表与 `user_models.policy` 列（保留供反查）；确认报告无遗留后由人工 DROP。
+
 ---
 
 ## 6. 附录
@@ -912,40 +900,37 @@ DELETE /admin/runtime/{model_id}
 | `conflict` | 409 | 否 | 重名冲突，或删除被引用资源（`message` 列出引用者） |
 | `disabled` | 403 | 否 | user model 被禁用 |
 | `target_unavailable` | 503 | **是** | 无可用目标：候选全被过滤 / 全部解析失败 |
-| `policy_error` | 503 | 否 | 策略脚本运行出错（脚本 bug，重试必然再失败） |
-| `policy_timeout` | 503 | **是** | 策略执行超时 |
 | `internal_error` | 500 | **是** | 其余一切；底层细节不外泄 |
 
-`retryable: true` 的三码是数据面重试决策的依据；其余重试无意义。
+`retryable: true` 的两码是数据面重试决策的依据；其余重试无意义。
 
 ### 6.2 跳过原因
 
-dispatch 响应 `decision.skipped[].reason` 的取值，按过滤顺序排列：
+dispatch 响应 `decision.skipped[].reason` 的取值（成员粒度，按判定优先级排列）：
 
 | reason | 含义 |
 | --- | --- |
-| `out_of_collection` | 引用不属于本集合（策略返回了越界目标） |
 | `already_tried` | 在请求的 `tried_ids` 里 |
 | `unknown_model` | 引用在 upstream 目录中已消失 |
 | `disabled` | 目录中该模型未启用 |
-| `cooling` | 目标处于冷却期 |
+| `cooling` | 目标处于冷却期（含限额冷却——限流上报转化的冷却） |
 | `resolve_failed` | 向 upstream 解析目标失败，`detail` 带原因 |
 
-### 6.3 策略脚本输入
+另有整组粒度：`decision.group_skips[].reason` 恒为 `group_exhausted`，表示该组全部成员因上述原因之一不可用，组合器已自动落到链上下一组。
 
-脚本收到的唯一入参 `input`（JSON 形态，由服务注入）：
+### 6.3 策略组合语义
 
-| 字段 | 类型 | 含义 |
-| --- | --- | --- |
-| `input.request` | object | 请求上下文，形态同 `RequestContext`（5.5） |
-| `input.collection` | object | 集合快照，形态同 [5.3](#53-集合快照) |
-| `input.runtime` | object | 键为 `model_id`，值为 `State`（形态同 5.5 的 `State`，`cooling_until` 为 Unix 秒） |
+组合器是内置纯函数，每次调度执行一次，输入为集合快照、运行态、`tried_ids`、`est_tokens` 与集合上的 `Strategy`，输出为**阶段化候选序列**：
 
-- `input` 结构里**没有任何凭据字段**——"策略读不到凭据"由类型定义保证，而非运行时过滤。
-- `input.runtime` 与 `input.request.tried_ids` 恒为容器（空为 `{}` / `[]`），不会是 `null`。
-- 返回值两种形态等价：对象 `{ candidates = {...}, note = "..." }`（Lua）/ `{ candidates: [...], note: "..." }`（JS/TS），或裸的候选数组（Lua `return {...}`，等价于只带 `candidates`）。`candidates` 是 `model_id` 有序数组；`note` 可选；无返回等价于空候选数组。
-- 返回的候选仍会经调度过滤（已尝试/目录消失/禁用/冷却），脚本写错也不会把流量打到坏目标上。
-- 策略输入速查内置于管理界面（frontend/ 策略编辑页侧栏）；可执行范例见 `backend/policy/examples/`。
+1. **未触发超长**（`overflow.enabled=false`，或 `est_tokens < threshold_tokens`）：按 `priority_chain`（空 = 组 `position` 顺序）逐组展开可用成员，`phase=standard`。
+2. **触发超长**（`overflow.enabled=true` 且阈值为正且 `est_tokens` ≥ 阈值）：先展开 `compact_groups` 的可用成员，`phase=compact`（数据面对其发压缩请求）；再按链展开，`phase=resume`（压缩完成后回落继续原任务）。
+
+展开规则的细节：
+
+- 成员不可用（`already_tried` / `unknown_model` / `disabled` / `cooling`）即跳过并记 `skipped`；组内可用成员为零时整组跳过并记 `group_skips`，**继续展开后续组**——"整组不可用自动降级到下一优先级组"由此实现，限额耗尽走的是 `cooling` 这一被动判定，服务不维护配额账本。
+- 候选段内去重；同一目标允许同时出现在 `compact` 与 `resume` 两段（压缩者与回落者可以是同一目标）。
+- 组合器只展开不解析：取凭据在组合器返回后由调度层完成，凭据结构上无法进入决策逻辑。
+- 数据面按 `candidates` 顺序执行、`phase` 决定动作，不问语义；决策溯源以 `collection_updated_at` 关联做出决策的配置版本。
 
 ### 6.4 运行参数（环境变量）
 
@@ -955,7 +940,6 @@ dispatch 响应 `decision.skipped[].reason` 的取值，按过滤顺序排列：
 | --- | --- | --- |
 | `MSR_COOLDOWN_THRESHOLD` | `3` | 连续失败达到该值进入冷却；`<=0` 从不冷却 |
 | `MSR_COOLDOWN_DURATION` | `1m` | 冷却时长 |
-| `MSR_POLICY_TIMEOUT` | `200ms` | 策略执行超时（4.2 / 5.5 的 `policy_timeout`） |
 | `MSR_CACHE_TTL` | 见 config | Redis 读缓存 TTL |
 
 连接类变量（`MSR_PG_DSN` / `MSR_REDIS_ADDR` / `MSR_REDIS_PASSWORD` / `MSR_REDIS_DB` / `MSR_DISPATCH_KEY` / `MSR_ADMIN_KEY` / `MSR_UPSTREAM_BASE_URL` / `MSR_UPSTREAM_DELIVERY_KEY` / `MSR_LISTEN`）见根 [README.md](../README.md)。
