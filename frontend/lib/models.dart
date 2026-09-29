@@ -12,8 +12,9 @@ const protocols = <String>[
   'gemini',
 ];
 
-/// 策略语言的封闭集合，与 backend 注册的运行时一致。
-const policyLanguages = <String>['lua', 'javascript', 'typescript'];
+/// 候选阶段取值，与 relayv1 契约字面量一致：未触发超长只有 standard；
+/// 触发后先 compact（压缩组托管）再 resume（回落原链继续）。
+const phases = <String>['standard', 'compact', 'resume'];
 
 DateTime? _time(Object? raw) {
   if (raw is! String || raw.isEmpty) return null;
@@ -166,41 +167,141 @@ class Snapshot {
       );
 }
 
-class Policy {
-  const Policy({
-    required this.name,
-    required this.language,
-    required this.source,
-    required this.note,
-    this.version = 0,
-    this.createdAt,
-    this.updatedAt,
+/// Strategy 是挂在 Collection 上的策略组合：优先级链 + 超长压缩托管。
+/// 两组字段缺省都按服务端 omitempty 语义解：空链表示"按组顺序"，
+/// overflow.enabled=false 表示托管关闭。
+class Strategy {
+  const Strategy({
+    this.priorityChain = const [],
+    this.overflow = const OverflowConfig(),
   });
 
-  final String name;
-  final String language;
-  final String source;
-  final String note;
-  final int version;
-  final DateTime? createdAt;
-  final DateTime? updatedAt;
+  final List<String> priorityChain;
+  final OverflowConfig overflow;
 
-  factory Policy.fromJson(Map<String, dynamic> json) => Policy(
-        name: _str(json['name']),
-        language: _str(json['language']),
-        source: _str(json['source']),
-        note: _str(json['note']),
-        version: _int(json['version']),
-        createdAt: _time(json['created_at']),
-        updatedAt: _time(json['updated_at']),
+  factory Strategy.fromJson(Map<String, dynamic> json) => Strategy(
+        priorityChain:
+            (json['priority_chain'] as List<dynamic>? ?? const []).cast<String>(),
+        overflow: json['overflow'] is Map<String, dynamic>
+            ? OverflowConfig.fromJson(json['overflow'] as Map<String, dynamic>)
+            : const OverflowConfig(),
       );
 
   Map<String, dynamic> toJson() => {
-        'name': name,
-        'language': language,
-        'source': source,
-        'note': note,
+        'priority_chain': priorityChain,
+        'overflow': overflow.toJson(),
       };
+}
+
+class OverflowConfig {
+  const OverflowConfig({
+    this.enabled = false,
+    this.thresholdTokens = 0,
+    this.compactGroups = const [],
+  });
+
+  final bool enabled;
+  final int thresholdTokens;
+  final List<String> compactGroups;
+
+  factory OverflowConfig.fromJson(Map<String, dynamic> json) => OverflowConfig(
+        enabled: json['enabled'] == true,
+        thresholdTokens: _int(json['threshold_tokens']),
+        compactGroups:
+            (json['compact_groups'] as List<dynamic>? ?? const []).cast<String>(),
+      );
+
+  Map<String, dynamic> toJson() => {
+        'enabled': enabled,
+        'threshold_tokens': thresholdTokens,
+        'compact_groups': compactGroups,
+      };
+
+  OverflowConfig copyWith({
+    bool? enabled,
+    int? thresholdTokens,
+    List<String>? compactGroups,
+  }) =>
+      OverflowConfig(
+        enabled: enabled ?? this.enabled,
+        thresholdTokens: thresholdTokens ?? this.thresholdTokens,
+        compactGroups: compactGroups ?? this.compactGroups,
+      );
+}
+
+class PhasedCandidate {
+  const PhasedCandidate({required this.modelId, required this.phase});
+
+  final String modelId;
+  final String phase;
+
+  factory PhasedCandidate.fromJson(Map<String, dynamic> json) =>
+      PhasedCandidate(
+        modelId: _str(json['model_id']),
+        phase: _str(json['phase']),
+      );
+}
+
+class GroupSkip {
+  const GroupSkip({required this.group, required this.reason, this.detail = ''});
+
+  final String group;
+  final String reason;
+  final String detail;
+
+  factory GroupSkip.fromJson(Map<String, dynamic> json) => GroupSkip(
+        group: _str(json['group']),
+        reason: _str(json['reason']),
+        detail: _str(json['detail']),
+      );
+}
+
+class MemberSkip {
+  const MemberSkip({
+    required this.modelId,
+    required this.group,
+    required this.reason,
+  });
+
+  final String modelId;
+  final String group;
+  final String reason;
+
+  factory MemberSkip.fromJson(Map<String, dynamic> json) => MemberSkip(
+        modelId: _str(json['model_id']),
+        group: _str(json['group']),
+        reason: _str(json['reason']),
+      );
+}
+
+/// DryRunDecision 是集合策略试运行的结果：与真实调度同一个 compose 核，
+/// 看到的序列就是上线后的序列。
+class DryRunDecision {
+  const DryRunDecision({
+    required this.collection,
+    this.candidates = const [],
+    this.groupSkips = const [],
+    this.skipped = const [],
+  });
+
+  final String collection;
+  final List<PhasedCandidate> candidates;
+  final List<GroupSkip> groupSkips;
+  final List<MemberSkip> skipped;
+
+  factory DryRunDecision.fromJson(Map<String, dynamic> json) =>
+      DryRunDecision(
+        collection: _str(json['collection']),
+        candidates: (json['candidates'] as List<dynamic>? ?? const [])
+            .map((e) => PhasedCandidate.fromJson(e as Map<String, dynamic>))
+            .toList(),
+        groupSkips: (json['group_skips'] as List<dynamic>? ?? const [])
+            .map((e) => GroupSkip.fromJson(e as Map<String, dynamic>))
+            .toList(),
+        skipped: (json['skipped'] as List<dynamic>? ?? const [])
+            .map((e) => MemberSkip.fromJson(e as Map<String, dynamic>))
+            .toList(),
+      );
 }
 
 /// UserModel 刻意没有密钥字段：服务端从不返回它，客户端也就无从持有。
@@ -209,7 +310,6 @@ class UserModel {
   const UserModel({
     required this.name,
     required this.collection,
-    required this.policy,
     required this.protocol,
     required this.enabled,
     this.note = '',
@@ -219,7 +319,6 @@ class UserModel {
 
   final String name;
   final String collection;
-  final String policy;
   final String protocol;
   final bool enabled;
   final String note;
@@ -229,7 +328,6 @@ class UserModel {
   factory UserModel.fromJson(Map<String, dynamic> json) => UserModel(
         name: _str(json['name']),
         collection: _str(json['collection']),
-        policy: _str(json['policy']),
         protocol: _str(json['protocol']),
         enabled: json['enabled'] == true,
         note: _str(json['note']),
@@ -240,13 +338,12 @@ class UserModel {
   Map<String, dynamic> toJson() => {
         'name': name,
         'collection': collection,
-        'policy': policy,
         'protocol': protocol,
         'enabled': enabled,
       };
 
   @override
-  String toString() => 'UserModel($name -> $collection, policy=$policy, '
+  String toString() => 'UserModel($name -> $collection, '
       'protocol=$protocol, enabled=$enabled)';
 }
 
@@ -314,55 +411,5 @@ class RuntimeState {
     if (!cooling || until == null) return null;
     final left = until.difference(DateTime.now());
     return left.isNegative ? Duration.zero : left;
-  }
-}
-
-/// RequestContext 是试运行时填给策略的请求上下文。
-class RequestContext {
-  const RequestContext({
-    this.userModel = '',
-    this.inboundProtocol = 'anthropic',
-    this.estTokens = 0,
-    this.triedIds = const [],
-    this.requestId = '',
-  });
-
-  final String userModel;
-  final String inboundProtocol;
-  final int estTokens;
-  final List<String> triedIds;
-  final String requestId;
-
-  Map<String, dynamic> toJson() => {
-        'user_model': userModel,
-        'inbound_protocol': inboundProtocol,
-        'est_tokens': estTokens,
-        'tried_ids': triedIds,
-        'request_id': requestId,
-      };
-}
-
-class DryRunResult {
-  const DryRunResult({
-    required this.policy,
-    required this.policyVersion,
-    required this.candidates,
-    required this.note,
-  });
-
-  final String policy;
-  final int policyVersion;
-  final List<String> candidates;
-  final String note;
-
-  factory DryRunResult.fromJson(Map<String, dynamic> json) {
-    final decision = json['decision'] as Map<String, dynamic>? ?? const {};
-    return DryRunResult(
-      policy: _str(json['policy']),
-      policyVersion: _int(json['policy_version']),
-      candidates:
-          (decision['candidates'] as List<dynamic>? ?? const []).cast<String>(),
-      note: _str(decision['note']),
-    );
   }
 }

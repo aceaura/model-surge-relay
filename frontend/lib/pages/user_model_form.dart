@@ -30,12 +30,10 @@ class _UserModelFormState extends State<_UserModelForm> {
   final _clientKey = TextEditingController();
 
   late String? _collection = widget.initial?.collection;
-  late String _policy = widget.initial?.policy ?? '';
   late String _protocol = widget.initial?.protocol ?? protocols.first;
   late bool _enabled = widget.initial?.enabled ?? true;
 
   List<CollectionInfo>? _collections;
-  List<Policy>? _policies;
   bool _busy = false;
   Object? _error;
   String? _fieldError;
@@ -56,11 +54,9 @@ class _UserModelFormState extends State<_UserModelForm> {
   Future<void> _loadOptions() async {
     try {
       final collections = await widget.client.listCollections();
-      final policies = await widget.client.listPolicies();
       if (!mounted) return;
       setState(() {
         _collections = collections;
-        _policies = policies;
         _collection ??= collections.isEmpty ? null : collections.first.name;
       });
     } catch (e) {
@@ -80,7 +76,6 @@ class _UserModelFormState extends State<_UserModelForm> {
     final draft = UserModel(
       name: _name.text.trim(),
       collection: collection,
-      policy: _policy,
       protocol: _protocol,
       enabled: _enabled,
     );
@@ -106,7 +101,6 @@ class _UserModelFormState extends State<_UserModelForm> {
   Widget build(BuildContext context) {
     final editing = widget.initial != null;
     final collections = _collections;
-    final policies = _policies;
 
     return AlertDialog(
       title: Text(editing ? '编辑 ${widget.initial!.name}' : '新建对外模型名'),
@@ -127,9 +121,9 @@ class _UserModelFormState extends State<_UserModelForm> {
                 ),
               ),
               const SizedBox(height: 16),
-              if (collections == null || policies == null)
+              if (collections == null)
                 const Center(child: CircularProgressIndicator())
-              else ...[
+              else
                 DropdownButtonFormField<String>(
                   initialValue: _collection,
                   decoration: InputDecoration(
@@ -145,24 +139,6 @@ class _UserModelFormState extends State<_UserModelForm> {
                       .toList(),
                   onChanged: (v) => setState(() => _collection = v),
                 ),
-                const SizedBox(height: 16),
-                DropdownButtonFormField<String>(
-                  initialValue: _policy,
-                  decoration: InputDecoration(
-                    labelText: '策略',
-                    border: const OutlineInputBorder(),
-                    errorText:
-                        _fieldError == 'policy' ? describeError(_error!) : null,
-                  ),
-                  items: [
-                    const DropdownMenuItem(
-                        value: '', child: Text('（不绑定，走兜底顺序）')),
-                    ...policies.map((p) => DropdownMenuItem(
-                        value: p.name, child: Text('${p.name}  v${p.version}'))),
-                  ],
-                  onChanged: (v) => setState(() => _policy = v ?? ''),
-                ),
-              ],
               const SizedBox(height: 16),
               DropdownButtonFormField<String>(
                 initialValue: _protocol,

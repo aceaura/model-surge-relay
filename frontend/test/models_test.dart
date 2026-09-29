@@ -122,30 +122,29 @@ void main() {
     });
   });
 
-  group('Policy 往返', () {
-    test('toJson 只提交可写字段，不回传 version', () {
-      const p = Policy(
-        name: 'failover',
-        language: 'lua',
-        source: 'return {}',
-        note: 'n',
-        version: 7,
+  group('Strategy 往返', () {
+    test('toJson 提交完整组合，fromJson 解回同一形状', () {
+      const st = Strategy(
+        priorityChain: ['main', 'backup'],
+        overflow: OverflowConfig(
+          enabled: true,
+          thresholdTokens: 200000,
+          compactGroups: ['comp'],
+        ),
       );
-      final json = p.toJson();
-      expect(json.keys, containsAll(['name', 'language', 'source', 'note']));
-      // version 由服务端裁定，客户端回传它没有意义。
-      expect(json.containsKey('version'), isFalse);
+      final round = Strategy.fromJson(st.toJson());
+      expect(round.priorityChain, ['main', 'backup']);
+      expect(round.overflow.enabled, isTrue);
+      expect(round.overflow.thresholdTokens, 200000);
+      expect(round.overflow.compactGroups, ['comp']);
     });
 
-    test('fromJson 解出服务端返回的版本', () {
-      final p = Policy.fromJson({
-        'name': 'failover',
-        'language': 'lua',
-        'source': 'return {}',
-        'note': '',
-        'version': 7,
-      });
-      expect(p.version, 7);
+    test('缺省字段解为默认组合：空链 + 托管关闭', () {
+      final st = Strategy.fromJson(const {});
+      expect(st.priorityChain, isEmpty);
+      expect(st.overflow.enabled, isFalse);
+      expect(st.overflow.thresholdTokens, 0);
+      expect(st.overflow.compactGroups, isEmpty);
     });
   });
 }

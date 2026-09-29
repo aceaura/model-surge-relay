@@ -5,6 +5,7 @@ import '../models.dart';
 import '../ui/feedback.dart';
 import 'group_form.dart';
 import 'members_editor.dart';
+import 'strategy_editor.dart';
 
 /// Collection 页是三栏主从布局：Collection → Group → 成员。
 /// 编排是个来回对照的过程，拆成多级页面跳转会不断打断它。
@@ -254,9 +255,17 @@ class _CollectionsPageState extends State<CollectionsPage> {
                       subtitle: c.note.isEmpty ? null : Text(c.note),
                       onTap: () => _select(c.name),
                       trailing: PopupMenuButton<String>(
-                        onSelected: (v) =>
-                            v == 'edit' ? _editNote(c) : _deleteCollection(c),
+                        onSelected: (v) => switch (v) {
+                          'edit' => _editNote(c),
+                          'strategy' => showStrategyEditor(
+                              context,
+                              client: widget.client,
+                              collection: c.name,
+                            ),
+                          _ => _deleteCollection(c),
+                        },
                         itemBuilder: (_) => const [
+                          PopupMenuItem(value: 'strategy', child: Text('策略组合')),
                           PopupMenuItem(value: 'edit', child: Text('编辑备注')),
                           PopupMenuItem(value: 'delete', child: Text('删除')),
                         ],

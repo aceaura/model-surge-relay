@@ -3,7 +3,6 @@ import 'package:window_manager/window_manager.dart';
 
 import 'api_client.dart';
 import 'pages/collections_page.dart';
-import 'pages/policies_page.dart';
 import 'pages/runtime_page.dart';
 import 'pages/settings_page.dart';
 import 'pages/user_models_page.dart';
@@ -107,8 +106,6 @@ class _AdminShellState extends State<AdminShell> {
       _NavGroup('调度', [
         _NavItem('collections', Icons.layers_outlined, '集合',
             () => CollectionsPage(client: client, onOpenSettings: _openSettings)),
-        _NavItem('policies', Icons.code_outlined, '策略',
-            () => PoliciesPage(client: client, onOpenSettings: _openSettings)),
         _NavItem('models', Icons.badge_outlined, '模型名',
             () => UserModelsPage(client: client, onOpenSettings: _openSettings)),
         _NavItem('runtime', Icons.monitor_heart_outlined, '运行态',

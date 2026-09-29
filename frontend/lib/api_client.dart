@@ -200,50 +200,33 @@ class ApiClient {
         body: {'members': modelIds},
       );
 
-  // ---- 策略 ----
+  // ---- 策略组合 ----
 
-  Future<List<Policy>> listPolicies() async {
-    final body = await _send('GET', '/admin/policies');
-    return (body['policies'] as List<dynamic>? ?? const [])
-        .map((e) => Policy.fromJson(e as Map<String, dynamic>))
-        .toList();
+  Future<Strategy> getStrategy(String collection) async {
+    final body =
+        await _send('GET', '/admin/collections/${_segment(collection)}/strategy');
+    return Strategy.fromJson(body);
   }
 
-  Future<Policy> getPolicy(String name) async {
-    final body = await _send('GET', '/admin/policies/${_segment(name)}');
-    return Policy.fromJson(body);
-  }
+  Future<void> putStrategy(String collection, Strategy st) => _send(
+        'PUT',
+        '/admin/collections/${_segment(collection)}/strategy',
+        body: st.toJson(),
+      );
 
-  Future<Policy> createPolicy(Policy p) async {
-    final body = await _send('POST', '/admin/policies', body: p.toJson());
-    return Policy.fromJson(body);
-  }
-
-  Future<Policy> updatePolicy(Policy p) async {
-    final body = await _send('PUT', '/admin/policies/${_segment(p.name)}',
-        body: p.toJson());
-    return Policy.fromJson(body);
-  }
-
-  Future<void> deletePolicy(String name) =>
-      _send('DELETE', '/admin/policies/${_segment(name)}');
-
-  Future<DryRunResult> dryRunPolicy(
-    String name, {
-    required String collection,
-    required RequestContext request,
-    Map<String, dynamic>? runtime,
+  /// 试运行与真实调度共用同一个 compose 核：看到的序列就是上线后的序列。
+  Future<DryRunDecision> dryRunStrategy(
+    String collection, {
+    int estTokens = 0,
+    List<String> triedIds = const [],
   }) async {
     final body = await _send(
       'POST',
-      '/admin/policies/${_segment(name)}/dry-run',
-      body: {
-        'collection': collection,
-        'request': request.toJson(),
-        'runtime': ?runtime,
-      },
+      '/admin/collections/${_segment(collection)}/strategy/dry-run',
+      body: {'est_tokens': estTokens, 'tried_ids': triedIds},
     );
-    return DryRunResult.fromJson(body);
+    final decision = body['decision'] as Map<String, dynamic>? ?? const {};
+    return DryRunDecision.fromJson(decision);
   }
 
   // ---- user model ----

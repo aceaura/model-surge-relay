@@ -170,14 +170,13 @@ void main() {
         body: jsonEncode({
           'name': 'pool',
           'collection': 'c1',
-          'policy': 'failover',
           'protocol': 'anthropic',
           'enabled': true,
         }),
       );
       final m = await client.getUserModel('pool');
       expect(m.name, 'pool');
-      expect(m.policy, 'failover');
+      expect(m.collection, 'c1');
     });
   });
 
@@ -189,7 +188,6 @@ void main() {
         const UserModel(
           name: 'pool',
           collection: 'c1',
-          policy: 'failover',
           protocol: 'anthropic',
           enabled: true,
         ),
@@ -225,25 +223,68 @@ void main() {
     });
   });
 
-  test('dry-run 解出候选与说明', () async {
+  test('策略组合往返：PUT 提交完整组合，GET 解出链与压缩配置', () async {
+    final captured = <http.BaseRequest>[];
     final client = _client(
-      [],
+      captured,
       body: jsonEncode({
-        'policy': 'failover',
-        'policy_version': 3,
-        'decision': {
-          'candidates': ['kimi-1/k3', 'ark-2/doubao'],
-          'note': 'group-by-group failover',
+        'priority_chain': ['main', 'backup'],
+        'overflow': {
+          'enabled': true,
+          'threshold_tokens': 200000,
+          'compact_groups': ['comp'],
         },
       }),
     );
-    final result = await client.dryRunPolicy(
-      'failover',
-      collection: 'c1',
-      request: const RequestContext(userModel: 'pool', requestId: 'r-1'),
+    final st = await client.getStrategy('c1');
+    expect(st.priorityChain, ['main', 'backup']);
+    expect(st.overflow.enabled, isTrue);
+    expect(st.overflow.thresholdTokens, 200000);
+    expect(st.overflow.compactGroups, ['comp']);
+
+    await client.putStrategy('c1', st);
+    final put = captured.last as http.Request;
+    expect(put.method, 'PUT');
+    expect(put.url.path, '/admin/collections/c1/strategy');
+    final body = jsonDecode(put.body) as Map<String, dynamic>;
+    expect(body['priority_chain'], ['main', 'backup']);
+    expect((body['overflow'] as Map<String, dynamic>)['threshold_tokens'],
+        200000);
+  });
+
+  test('策略 dry-run 解出阶段化候选与跳过清单', () async {
+    final captured = <http.BaseRequest>[];
+    final client = _client(
+      captured,
+      body: jsonEncode({
+        'decision': {
+          'collection': 'c1',
+          'candidates': [
+            {'model_id': 'kimi-1/k3', 'phase': 'compact'},
+            {'model_id': 'ark-2/doubao', 'phase': 'resume'},
+          ],
+          'group_skips': [
+            {'group': 'main', 'reason': 'group_exhausted', 'detail': 'all 2 members unavailable'},
+          ],
+          'skipped': [
+            {'model_id': 'kimi-1/k3', 'group': 'main', 'reason': 'cooling'},
+          ],
+        },
+      }),
     );
-    expect(result.policyVersion, 3);
-    expect(result.candidates, ['kimi-1/k3', 'ark-2/doubao']);
-    expect(result.note, 'group-by-group failover');
+    final result = await client.dryRunStrategy('c1',
+        estTokens: 300000, triedIds: ['ark-2/doubao']);
+
+    final sent = captured.single as http.Request;
+    expect(sent.url.path, '/admin/collections/c1/strategy/dry-run');
+    final reqBody = jsonDecode(sent.body) as Map<String, dynamic>;
+    expect(reqBody['est_tokens'], 300000);
+    expect(reqBody['tried_ids'], ['ark-2/doubao']);
+
+    expect(result.candidates.map((c) => c.modelId),
+        ['kimi-1/k3', 'ark-2/doubao']);
+    expect(result.candidates.map((c) => c.phase), ['compact', 'resume']);
+    expect(result.groupSkips.single.group, 'main');
+    expect(result.skipped.single.reason, 'cooling');
   });
 }

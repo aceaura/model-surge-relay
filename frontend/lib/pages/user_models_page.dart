@@ -127,7 +127,6 @@ class _UserModelsPageState extends State<UserModelsPage> {
                       title: Text(m.name),
                       subtitle: Text(
                         '集合 ${m.collection}  ·  '
-                        '策略 ${m.policy.isEmpty ? "（兜底顺序）" : m.policy}  ·  '
                         '${m.protocol.isEmpty ? "任意协议" : m.protocol}',
                       ),
                       onTap: () => _openForm(initial: m),

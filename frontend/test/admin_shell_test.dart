@@ -28,15 +28,16 @@ void main() {
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 100));
 
-    // 品牌头与两个分组、五个导航项齐全。
+    // 品牌头与两个分组、四个导航项齐全。
     expect(find.text('ModelSurge Relay'), findsOneWidget);
     expect(find.text('调度'), findsOneWidget);
     expect(find.text('系统'), findsOneWidget);
     expect(find.text('集合'), findsOneWidget);
-    expect(find.text('策略'), findsOneWidget);
     expect(find.text('模型名'), findsOneWidget);
     expect(find.text('运行态'), findsOneWidget);
     expect(find.text('连接设置'), findsOneWidget);
+    // 策略页已随脚本模式整体下线。
+    expect(find.text('策略'), findsNothing);
     // 底部连接状态卡显示地址与脱敏密钥。
     expect(find.text('http://127.0.0.1:9'), findsOneWidget);
     expect(find.text('key secr***3456'), findsOneWidget);

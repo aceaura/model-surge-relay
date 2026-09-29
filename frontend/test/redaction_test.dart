@@ -15,7 +15,6 @@ void main() {
     const m = UserModel(
       name: 'pool',
       collection: 'c1',
-      policy: 'failover',
       protocol: 'anthropic',
       enabled: true,
       note: secret, // 就算有人把密钥误填进备注，也只影响备注，不新增泄漏面
@@ -29,7 +28,6 @@ void main() {
     final m = UserModel.fromJson({
       'name': 'pool',
       'collection': 'c1',
-      'policy': '',
       'protocol': 'anthropic',
       'enabled': true,
       'client_key': 'sk-should-be-ignored',
