@@ -10,6 +10,7 @@ import (
 
 	"github.com/aceaura/model-surge-relay/backend/apperr"
 	"github.com/aceaura/model-surge-relay/backend/cache"
+	"github.com/aceaura/model-surge-relay/backend/strategy"
 	"github.com/aceaura/model-surge-relay/backend/upstreamclient"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -36,14 +37,18 @@ func (r *Repo) Create(ctx context.Context, name, note string) (Collection, error
 		return Collection{}, apperr.Field(apperr.InvalidRequest, "name", "name is required")
 	}
 	var out Collection
+	var rawStrategy json.RawMessage
 	err := r.pool.QueryRow(ctx,
 		`INSERT INTO collections (name, note) VALUES ($1, $2)
-		 RETURNING name, note, created_at, updated_at`, name, note).
-		Scan(&out.Name, &out.Note, &out.CreatedAt, &out.UpdatedAt)
+		 RETURNING name, note, strategy, created_at, updated_at`, name, note).
+		Scan(&out.Name, &out.Note, &rawStrategy, &out.CreatedAt, &out.UpdatedAt)
 	if isUniqueViolation(err) {
 		return Collection{}, apperr.New(apperr.Conflict, fmt.Sprintf("collection %q already exists", name))
 	}
 	if err != nil {
+		return Collection{}, err
+	}
+	if out.Strategy, err = decodeStrategy(rawStrategy); err != nil {
 		return Collection{}, err
 	}
 	return out, nil
@@ -51,13 +56,17 @@ func (r *Repo) Create(ctx context.Context, name, note string) (Collection, error
 
 func (r *Repo) Get(ctx context.Context, name string) (Collection, error) {
 	var out Collection
+	var rawStrategy json.RawMessage
 	err := r.pool.QueryRow(ctx,
-		`SELECT name, note, created_at, updated_at FROM collections WHERE name = $1`, name).
-		Scan(&out.Name, &out.Note, &out.CreatedAt, &out.UpdatedAt)
+		`SELECT name, note, strategy, created_at, updated_at FROM collections WHERE name = $1`, name).
+		Scan(&out.Name, &out.Note, &rawStrategy, &out.CreatedAt, &out.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Collection{}, apperr.New(apperr.NotFound, fmt.Sprintf("collection %q not found", name))
 	}
 	if err != nil {
+		return Collection{}, err
+	}
+	if out.Strategy, err = decodeStrategy(rawStrategy); err != nil {
 		return Collection{}, err
 	}
 	return out, nil
@@ -65,7 +74,7 @@ func (r *Repo) Get(ctx context.Context, name string) (Collection, error) {
 
 func (r *Repo) List(ctx context.Context) ([]Collection, error) {
 	rows, err := r.pool.Query(ctx,
-		`SELECT name, note, created_at, updated_at FROM collections ORDER BY name`)
+		`SELECT name, note, strategy, created_at, updated_at FROM collections ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
@@ -73,12 +82,42 @@ func (r *Repo) List(ctx context.Context) ([]Collection, error) {
 	out := []Collection{}
 	for rows.Next() {
 		var c Collection
-		if err := rows.Scan(&c.Name, &c.Note, &c.CreatedAt, &c.UpdatedAt); err != nil {
+		var rawStrategy json.RawMessage
+		if err := rows.Scan(&c.Name, &c.Note, &rawStrategy, &c.CreatedAt, &c.UpdatedAt); err != nil {
+			return nil, err
+		}
+		if c.Strategy, err = decodeStrategy(rawStrategy); err != nil {
 			return nil, err
 		}
 		out = append(out, c)
 	}
 	return out, rows.Err()
+}
+
+// SetStrategy 整体替换集合的策略组合。先按本集合现有组校验引用完整性，
+// 再落库并使快照缓存失效——调度读到的策略与成员永远来自同一份快照。
+func (r *Repo) SetStrategy(ctx context.Context, name string, st strategy.Strategy) error {
+	groups, err := r.Groups(ctx, name)
+	if err != nil {
+		return err
+	}
+	if err := validateStrategy(st, groups); err != nil {
+		return err
+	}
+	raw, err := json.Marshal(st)
+	if err != nil {
+		return err
+	}
+	tag, err := r.pool.Exec(ctx,
+		`UPDATE collections SET strategy = $2, updated_at = now() WHERE name = $1`, name, raw)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return apperr.New(apperr.NotFound, fmt.Sprintf("collection %q not found", name))
+	}
+	r.invalidate(ctx, name)
+	return nil
 }
 
 func (r *Repo) UpdateNote(ctx context.Context, name, note string) error {
@@ -167,7 +206,18 @@ func (r *Repo) UpdateGroup(ctx context.Context, g Group) error {
 	return nil
 }
 
+// DeleteGroup 删除组。组仍被策略组合（优先级链或压缩组）引用时拒绝：
+// 静默级联会让调度行为在没人察觉的情况下改变。
 func (r *Repo) DeleteGroup(ctx context.Context, collectionName, groupName string) error {
+	col, err := r.Get(ctx, collectionName)
+	if err != nil {
+		return err
+	}
+	if refs := strategyReferences(col.Strategy, groupName); len(refs) > 0 {
+		return apperr.New(apperr.Conflict, fmt.Sprintf(
+			"group %q is still referenced by strategy %s of collection %q",
+			groupName, strings.Join(refs, ", "), collectionName))
+	}
 	tag, err := r.pool.Exec(ctx,
 		`DELETE FROM groups WHERE collection = $1 AND name = $2`, collectionName, groupName)
 	if err != nil {
@@ -321,7 +371,8 @@ func (r *Repo) Snapshot(ctx context.Context, collectionName string) (Snapshot, e
 }
 
 func (r *Repo) buildSnapshot(ctx context.Context, collectionName string) (Snapshot, error) {
-	if _, err := r.Get(ctx, collectionName); err != nil {
+	col, err := r.Get(ctx, collectionName)
+	if err != nil {
 		return Snapshot{}, err
 	}
 	groups, err := r.groups(ctx, collectionName)
@@ -337,7 +388,7 @@ func (r *Repo) buildSnapshot(ctx context.Context, collectionName string) (Snapsh
 		byID[l.ID] = l
 	}
 
-	snap := Snapshot{Name: collectionName, Groups: make([]GroupSnapshot, 0, len(groups))}
+	snap := Snapshot{Name: collectionName, Strategy: col.Strategy, Groups: make([]GroupSnapshot, 0, len(groups))}
 	for _, g := range groups {
 		gs := GroupSnapshot{
 			Name:     g.Name,
@@ -372,6 +423,18 @@ func (r *Repo) buildSnapshot(ctx context.Context, collectionName string) (Snapsh
 
 func (r *Repo) invalidate(ctx context.Context, collectionName string) {
 	r.cache.Invalidate(ctx, cache.CollectionKey(collectionName))
+}
+
+// decodeStrategy 把 JSONB 列还原为策略组合；空值（老行）按零值处理。
+func decodeStrategy(raw json.RawMessage) (strategy.Strategy, error) {
+	var st strategy.Strategy
+	if len(raw) == 0 {
+		return st, nil
+	}
+	if err := json.Unmarshal(raw, &st); err != nil {
+		return st, fmt.Errorf("decode strategy: %w", err)
+	}
+	return st, nil
 }
 
 func isUniqueViolation(err error) bool { return pgErrorCode(err) == "23505" }

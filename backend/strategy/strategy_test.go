@@ -4,22 +4,18 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/aceaura/model-surge-relay/backend/collection"
 	"github.com/aceaura/model-surge-relay/backend/runstate"
 )
 
-func member(id string) collection.Member {
-	return collection.Member{ModelID: id, Known: true, Enabled: true}
+func member(id string) Member {
+	return Member{ModelID: id, Known: true, Enabled: true}
 }
 
-func snap() collection.Snapshot {
-	return collection.Snapshot{
-		Name: "demo",
-		Groups: []collection.GroupSnapshot{
-			{Name: "main", Type: "primary", Position: 1, Members: []collection.Member{member("a/1"), member("a/2")}},
-			{Name: "backup", Type: "backup", Position: 2, Members: []collection.Member{member("b/1")}},
-			{Name: "compact", Type: "compact", Position: 3, Members: []collection.Member{member("c/1")}},
-		},
+func groups() []Group {
+	return []Group{
+		{Name: "main", Members: []Member{member("a/1"), member("a/2")}},
+		{Name: "backup", Members: []Member{member("b/1")}},
+		{Name: "compact", Members: []Member{member("c/1")}},
 	}
 }
 
@@ -140,7 +136,7 @@ func TestCompose(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			cands, skips := Compose(snap(), tc.states, tc.tried, tc.estTokens, tc.strategy)
+			cands, skips := Compose(groups(), tc.states, tc.tried, tc.estTokens, tc.strategy)
 			if !reflect.DeepEqual(cands, tc.wantCands) {
 				t.Errorf("candidates = %+v, want %+v", cands, tc.wantCands)
 			}

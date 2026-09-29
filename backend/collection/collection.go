@@ -5,13 +5,16 @@ package collection
 import (
 	"encoding/json"
 	"time"
+
+	"github.com/aceaura/model-surge-relay/backend/strategy"
 )
 
 type Collection struct {
-	Name      string    `json:"name"`
-	Note      string    `json:"note"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	Name      string            `json:"name"`
+	Note      string            `json:"note"`
+	Strategy  strategy.Strategy `json:"strategy"`
+	CreatedAt time.Time         `json:"created_at"`
+	UpdatedAt time.Time         `json:"updated_at"`
 }
 
 // Group 的 Type 是数据库中的自由文本，不是代码枚举：
@@ -25,10 +28,12 @@ type Group struct {
 	Members    []string        `json:"members"`
 }
 
-// Snapshot 是策略输入与调度过滤共用的视图：成员已带目录属性。
+// Snapshot 是策略输入与调度过滤共用的视图：成员已带目录属性，
+// 并随快照携带集合的策略组合（与配置同一份缓存，调度不再多一次读）。
 type Snapshot struct {
-	Name   string          `json:"name"`
-	Groups []GroupSnapshot `json:"groups"`
+	Name     string            `json:"name"`
+	Strategy strategy.Strategy `json:"strategy"`
+	Groups   []GroupSnapshot   `json:"groups"`
 }
 
 // MarshalJSON 保证 groups 恒为数组而非 null：策略脚本直接遍历这个字段，

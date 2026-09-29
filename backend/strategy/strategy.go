@@ -3,12 +3,14 @@
 // 组合器只做展开，不做解析：输出是带阶段的候选 model_id 序列，取凭据与
 // 合并参数始终由调度层在组合器返回后完成。与脚本时代同一条边界——凭据
 // 永不进入决策逻辑。
+//
+// 本包不依赖 collection：快照视图用本包自带的 Group/Member，由调度层
+// 适配。这样 collection 可以反向持有 Strategy 类型而不成环。
 package strategy
 
 import (
 	"fmt"
 
-	"github.com/aceaura/model-surge-relay/backend/collection"
 	"github.com/aceaura/model-surge-relay/backend/runstate"
 )
 
@@ -37,6 +39,19 @@ type Overflow struct {
 	CompactGroups   []string `json:"compact_groups,omitempty"`
 }
 
+// Group 是组合器看到的组视图（由 collection.Snapshot 适配而来）。
+type Group struct {
+	Name    string
+	Members []Member
+}
+
+// Member 是组合器看到的成员视图：只含可用性判定需要的三位。
+type Member struct {
+	ModelID string
+	Known   bool
+	Enabled bool
+}
+
 // Candidate 是阶段化候选。
 type Candidate struct {
 	ModelID string `json:"model_id"`
@@ -50,7 +65,8 @@ type GroupSkip struct {
 	Detail string `json:"detail,omitempty"`
 }
 
-// Compose 是纯函数：无 IO、无沙箱、可并发。
+// Compose 是纯函数：无 IO、无沙箱、可并发。groups 需已按期望的默认顺序
+// （组 position）排好——Strategy.PriorityChain 为空时直接按此序展开。
 //
 // 展开规则：未触发超长时按链（或默认组序）逐组展开，phase=standard；
 // 触发超长（enabled 且阈值有效且 est_tokens 达到）时先展开压缩组
@@ -58,7 +74,7 @@ type GroupSkip struct {
 // 跳过并记录 GroupSkip，继续展开后续组。去重按段内进行：同一成员允许
 // 同时出现在 compact 与 resume 两段（压缩者与回落者可以是同一目标）。
 func Compose(
-	snap collection.Snapshot,
+	groups []Group,
 	states map[string]runstate.State,
 	triedIDs []string,
 	estTokens int,
@@ -71,8 +87,8 @@ func Compose(
 
 	chain := st.PriorityChain
 	if len(chain) == 0 {
-		chain = make([]string, 0, len(snap.Groups))
-		for _, g := range snap.Groups {
+		chain = make([]string, 0, len(groups))
+		for _, g := range groups {
 			chain = append(chain, g.Name)
 		}
 	}
@@ -80,16 +96,16 @@ func Compose(
 	cands := []Candidate{}
 	skips := []GroupSkip{}
 	if st.Overflow.triggered(estTokens) {
-		c, s := expand(snap, st.Overflow.CompactGroups, PhaseCompact, states, tried)
+		c, s := expand(groups, st.Overflow.CompactGroups, PhaseCompact, states, tried)
 		cands = append(cands, c...)
 		skips = append(skips, s...)
-		c, s = expand(snap, chain, PhaseResume, states, tried)
+		c, s = expand(groups, chain, PhaseResume, states, tried)
 		cands = append(cands, c...)
 		skips = append(skips, s...)
 		return cands, skips
 	}
 
-	c, s := expand(snap, chain, PhaseStandard, states, tried)
+	c, s := expand(groups, chain, PhaseStandard, states, tried)
 	return append(cands, c...), append(skips, s...)
 }
 
@@ -99,19 +115,24 @@ func (o Overflow) triggered(estTokens int) bool {
 	return o.Enabled && o.ThresholdTokens > 0 && estTokens >= o.ThresholdTokens
 }
 
-// expand 按给定组序逐组展开可用成员。段内按 model_id 去重。
+// expand 按给定组名序逐组展开可用成员。段内按 model_id 去重。
 func expand(
-	snap collection.Snapshot,
-	groups []string,
+	groups []Group,
+	chain []string,
 	phase string,
 	states map[string]runstate.State,
 	tried map[string]bool,
 ) ([]Candidate, []GroupSkip) {
+	byName := make(map[string]Group, len(groups))
+	for _, g := range groups {
+		byName[g.Name] = g
+	}
+
 	cands := []Candidate{}
 	skips := []GroupSkip{}
 	seen := map[string]bool{}
-	for _, name := range groups {
-		g, ok := findGroup(snap, name)
+	for _, name := range chain {
+		g, ok := byName[name]
 		if !ok {
 			// 配置校验保证链内组存在；运行期组被并发删掉时降级为跳过而非 panic。
 			skips = append(skips, GroupSkip{
@@ -140,15 +161,6 @@ func expand(
 
 // unavailable 与调度层过滤语义一致：已试过、目录未知、未启用、冷却中
 // （含限额冷却——被动限额判定，不新增配额账本）。
-func unavailable(m collection.Member, s runstate.State, tried map[string]bool) bool {
+func unavailable(m Member, s runstate.State, tried map[string]bool) bool {
 	return tried[m.ModelID] || !m.Known || !m.Enabled || s.Cooling
-}
-
-func findGroup(snap collection.Snapshot, name string) (collection.GroupSnapshot, bool) {
-	for _, g := range snap.Groups {
-		if g.Name == name {
-			return g, true
-		}
-	}
-	return collection.GroupSnapshot{}, false
 }

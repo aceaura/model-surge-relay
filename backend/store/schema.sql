@@ -1,9 +1,13 @@
 CREATE TABLE IF NOT EXISTS collections (
     name       TEXT PRIMARY KEY,
     note       TEXT        NOT NULL DEFAULT '',
+    strategy   JSONB       NOT NULL DEFAULT '{}',
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- 幂等 DDL 同时承担迁移：老库补列。
+ALTER TABLE collections ADD COLUMN IF NOT EXISTS strategy JSONB NOT NULL DEFAULT '{}';
 
 CREATE TABLE IF NOT EXISTS groups (
     collection TEXT        NOT NULL REFERENCES collections(name) ON DELETE CASCADE,
