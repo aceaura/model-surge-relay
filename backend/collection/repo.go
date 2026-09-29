@@ -388,7 +388,12 @@ func (r *Repo) buildSnapshot(ctx context.Context, collectionName string) (Snapsh
 		byID[l.ID] = l
 	}
 
-	snap := Snapshot{Name: collectionName, Strategy: col.Strategy, Groups: make([]GroupSnapshot, 0, len(groups))}
+	snap := Snapshot{
+		Name:      collectionName,
+		Strategy:  col.Strategy,
+		UpdatedAt: col.UpdatedAt,
+		Groups:    make([]GroupSnapshot, 0, len(groups)),
+	}
 	for _, g := range groups {
 		gs := GroupSnapshot{
 			Name:     g.Name,

@@ -6,8 +6,8 @@ import (
 
 	"github.com/aceaura/model-surge-relay/backend/apperr"
 	"github.com/aceaura/model-surge-relay/backend/collection"
-	"github.com/aceaura/model-surge-relay/backend/policy"
 	"github.com/aceaura/model-surge-relay/backend/runstate"
+	"github.com/aceaura/model-surge-relay/backend/strategy"
 	"github.com/aceaura/model-surge-relay/backend/usermodel"
 )
 
@@ -29,12 +29,14 @@ func (s *Server) routeAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE "+base+"/collections/{name}/groups/{group}", s.deleteGroup)
 	mux.HandleFunc("PUT "+base+"/collections/{name}/groups/{group}/members", s.replaceMembers)
 
-	mux.HandleFunc("GET "+base+"/policies", s.listPolicies)
-	mux.HandleFunc("POST "+base+"/policies", s.createPolicy)
-	mux.HandleFunc("GET "+base+"/policies/{name}", s.getPolicy)
-	mux.HandleFunc("PUT "+base+"/policies/{name}", s.updatePolicy)
-	mux.HandleFunc("DELETE "+base+"/policies/{name}", s.deletePolicy)
-	mux.HandleFunc("POST "+base+"/policies/{name}/dry-run", s.dryRunPolicy)
+	// 策略组合挂在集合上：优先级链 + 超长压缩托管。dry-run 与真实调度
+	// 共用同一个 compose 核，试运行看到的序列就是上线后的序列。
+	mux.HandleFunc("GET "+base+"/collections/{name}/strategy", s.getStrategy)
+	mux.HandleFunc("PUT "+base+"/collections/{name}/strategy", s.putStrategy)
+	mux.HandleFunc("POST "+base+"/collections/{name}/strategy/dry-run", s.dryRunStrategy)
+
+	// 一次性迁移：脚本策略 → 组合配置。可重复执行，报告三类清单。
+	mux.HandleFunc("POST "+base+"/migrate-policies", s.migratePolicies)
 
 	mux.HandleFunc("GET "+base+"/user-models", s.listUserModels)
 	mux.HandleFunc("POST "+base+"/user-models", s.createUserModel)
@@ -190,120 +192,61 @@ func (s *Server) replaceMembers(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-type policyBody struct {
-	Name     string `json:"name"`
-	Language string `json:"language"`
-	Source   string `json:"source"`
-	Note     string `json:"note"`
-}
-
-func (s *Server) listPolicies(w http.ResponseWriter, r *http.Request) {
-	out, err := s.Policies.List(r.Context())
+func (s *Server) getStrategy(w http.ResponseWriter, r *http.Request) {
+	out, err := s.Collections.Get(r.Context(), r.PathValue("name"))
 	if err != nil {
 		writeError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"policies": out})
+	writeJSON(w, http.StatusOK, out.Strategy)
 }
 
-func (s *Server) createPolicy(w http.ResponseWriter, r *http.Request) {
-	var body policyBody
-	if !decode(w, r, &body) {
+func (s *Server) putStrategy(w http.ResponseWriter, r *http.Request) {
+	var st strategy.Strategy
+	if !decode(w, r, &st) {
 		return
 	}
-	out, err := s.Policies.Create(r.Context(), policy.Policy{
-		Name:     body.Name,
-		Language: policy.Language(body.Language),
-		Source:   body.Source,
-		Note:     body.Note,
-	})
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusCreated, out)
-}
-
-func (s *Server) getPolicy(w http.ResponseWriter, r *http.Request) {
-	out, err := s.Policies.Get(r.Context(), r.PathValue("name"))
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, out)
-}
-
-func (s *Server) updatePolicy(w http.ResponseWriter, r *http.Request) {
-	var body policyBody
-	if !decode(w, r, &body) {
-		return
-	}
-	out, err := s.Policies.Update(r.Context(), policy.Policy{
-		Name:     r.PathValue("name"),
-		Language: policy.Language(body.Language),
-		Source:   body.Source,
-		Note:     body.Note,
-	})
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, out)
-}
-
-func (s *Server) deletePolicy(w http.ResponseWriter, r *http.Request) {
-	if err := s.Policies.Delete(r.Context(), r.PathValue("name")); err != nil {
+	if err := s.Collections.SetStrategy(r.Context(), r.PathValue("name"), st); err != nil {
 		writeError(w, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// dryRunPolicy 用给定输入试运行策略：读 Collection 快照，但不碰运行态、
-// 不写缓存、不解析目标，因此不影响任何真实请求。
-func (s *Server) dryRunPolicy(w http.ResponseWriter, r *http.Request) {
+// dryRunStrategy 试运行集合的策略组合：与真实调度共用 compose 核，
+// 不解析目标、不写运行态，因此不影响任何真实请求。
+func (s *Server) dryRunStrategy(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Collection string                  `json:"collection"`
-		Request    policy.RequestContext   `json:"request"`
-		Runtime    map[string]policy.State `json:"runtime,omitempty"`
+		EstTokens int      `json:"est_tokens"`
+		TriedIDs  []string `json:"tried_ids,omitempty"`
 	}
 	if !decode(w, r, &body) {
 		return
 	}
-	p, err := s.Policies.Get(r.Context(), r.PathValue("name"))
+	out, err := s.Dispatch.DryRun(r.Context(), r.PathValue("name"), body.EstTokens, body.TriedIDs)
 	if err != nil {
 		writeError(w, err)
 		return
 	}
-	snap, err := s.Collections.Snapshot(r.Context(), body.Collection)
+	writeJSON(w, http.StatusOK, map[string]any{"decision": out})
+}
+
+func (s *Server) migratePolicies(w http.ResponseWriter, r *http.Request) {
+	if s.Migrator == nil {
+		writeError(w, apperr.New(apperr.Conflict, "policy migration is not available on this deployment"))
+		return
+	}
+	report, err := s.Migrator.Migrate(r.Context())
 	if err != nil {
 		writeError(w, err)
 		return
 	}
-	runtimeStates := body.Runtime
-	if runtimeStates == nil {
-		runtimeStates = map[string]policy.State{}
-	}
-	decision, err := s.Engine.Execute(r.Context(), p, policy.Input{
-		Request:    body.Request,
-		Collection: snap,
-		Runtime:    runtimeStates,
-	})
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"policy":         p.Name,
-		"policy_version": p.Version,
-		"decision":       decision,
-	})
+	writeJSON(w, http.StatusOK, report)
 }
 
 type userModelBody struct {
 	Name       string `json:"name"`
 	Collection string `json:"collection"`
-	Policy     string `json:"policy"`
 	ClientKey  string `json:"client_key"`
 	Protocol   string `json:"protocol"`
 	Enabled    bool   `json:"enabled"`
@@ -326,7 +269,6 @@ func (s *Server) createUserModel(w http.ResponseWriter, r *http.Request) {
 	out, err := s.UserModels.Create(r.Context(), usermodel.UserModel{
 		Name:       body.Name,
 		Collection: body.Collection,
-		Policy:     body.Policy,
 		ClientKey:  body.ClientKey,
 		Protocol:   body.Protocol,
 		Enabled:    body.Enabled,
@@ -355,7 +297,6 @@ func (s *Server) updateUserModel(w http.ResponseWriter, r *http.Request) {
 	out, err := s.UserModels.Update(r.Context(), usermodel.UserModel{
 		Name:       r.PathValue("name"),
 		Collection: body.Collection,
-		Policy:     body.Policy,
 		ClientKey:  body.ClientKey,
 		Protocol:   body.Protocol,
 		Enabled:    body.Enabled,

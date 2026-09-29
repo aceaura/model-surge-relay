@@ -26,15 +26,12 @@ func (l SlogLogger) Dispatched(e dispatch.LogEntry) {
 		"skipped", skipReasons(e),
 		"duration_ms", e.Duration.Milliseconds(),
 	}
-	if e.Policy != "" {
-		attrs = append(attrs, "policy", e.Policy, "policy_version", e.PolicyVersion)
-	}
 	if e.Error != "" {
 		attrs = append(attrs, "error", e.Error)
 		logger.Error("dispatch failed", attrs...)
 		return
 	}
-	attrs = append(attrs, "selected", e.Selected)
+	attrs = append(attrs, "selected", e.Selected, "phase", e.SelectedPhase)
 	logger.Info("dispatched", attrs...)
 }
 

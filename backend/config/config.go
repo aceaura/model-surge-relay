@@ -22,7 +22,6 @@ type Config struct {
 	AdminKey            string
 	UpstreamBaseURL     string
 	UpstreamDeliveryKey string
-	PolicyTimeout       time.Duration
 	CooldownThreshold   int
 	CooldownDuration    time.Duration
 	Listen              string
@@ -30,7 +29,6 @@ type Config struct {
 
 const (
 	defaultCacheTTL          = time.Minute
-	defaultPolicyTimeout     = 200 * time.Millisecond
 	defaultCooldownThreshold = 3
 	defaultCooldownDuration  = time.Minute
 	defaultListen            = ":8080"
@@ -70,9 +68,6 @@ func Load() (Config, error) {
 
 	var err error
 	if cfg.CacheTTL, err = duration("MSR_CACHE_TTL", defaultCacheTTL); err != nil {
-		return Config{}, err
-	}
-	if cfg.PolicyTimeout, err = duration("MSR_POLICY_TIMEOUT", defaultPolicyTimeout); err != nil {
 		return Config{}, err
 	}
 	if cfg.CooldownDuration, err = duration("MSR_COOLDOWN_DURATION", defaultCooldownDuration); err != nil {

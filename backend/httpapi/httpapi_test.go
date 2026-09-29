@@ -16,8 +16,9 @@ import (
 	"github.com/aceaura/model-surge-relay/backend/collection"
 	"github.com/aceaura/model-surge-relay/backend/contract/relayv1"
 	"github.com/aceaura/model-surge-relay/backend/dispatch"
-	"github.com/aceaura/model-surge-relay/backend/policy"
+	"github.com/aceaura/model-surge-relay/backend/migrate"
 	"github.com/aceaura/model-surge-relay/backend/runstate"
+	"github.com/aceaura/model-surge-relay/backend/strategy"
 	"github.com/aceaura/model-surge-relay/backend/upstreamclient"
 	"github.com/aceaura/model-surge-relay/backend/usermodel"
 )
@@ -38,11 +39,12 @@ func (h stubHealth) CacheReady(context.Context) bool    { return h.cache }
 func (h stubHealth) UpstreamReady(context.Context) bool { return h.upstream }
 
 type stubCollections struct {
-	snap    collection.Snapshot
-	created collection.Collection
-	groups  []collection.Group
-	members []string
-	err     error
+	snap     collection.Snapshot
+	created  collection.Collection
+	groups   []collection.Group
+	members  []string
+	strategy strategy.Strategy
+	err      error
 }
 
 func (c *stubCollections) Create(_ context.Context, name, note string) (collection.Collection, error) {
@@ -57,7 +59,7 @@ func (c *stubCollections) Get(_ context.Context, name string) (collection.Collec
 	if c.err != nil {
 		return collection.Collection{}, c.err
 	}
-	return collection.Collection{Name: name}, nil
+	return collection.Collection{Name: name, Strategy: c.strategy}, nil
 }
 
 func (c *stubCollections) List(context.Context) ([]collection.Collection, error) {
@@ -93,57 +95,23 @@ func (c *stubCollections) Snapshot(context.Context, string) (collection.Snapshot
 	return c.snap, c.err
 }
 
-type stubPolicies struct {
-	record  policy.Policy
-	err     error
-	deleted string
-}
-
-func (p *stubPolicies) Create(_ context.Context, in policy.Policy) (policy.Policy, error) {
-	if p.err != nil {
-		return policy.Policy{}, p.err
+func (c *stubCollections) SetStrategy(_ context.Context, _ string, st strategy.Strategy) error {
+	if c.err != nil {
+		return c.err
 	}
-	in.Version = 1
-	p.record = in
-	return in, nil
-}
-
-func (p *stubPolicies) Update(_ context.Context, in policy.Policy) (policy.Policy, error) {
-	if p.err != nil {
-		return policy.Policy{}, p.err
-	}
-	in.Version = p.record.Version + 1
-	p.record = in
-	return in, nil
-}
-
-func (p *stubPolicies) Get(context.Context, string) (policy.Policy, error) {
-	return p.record, p.err
-}
-
-func (p *stubPolicies) List(context.Context) ([]policy.Policy, error) {
-	return []policy.Policy{p.record}, p.err
-}
-
-func (p *stubPolicies) Delete(_ context.Context, name string) error {
-	if p.err != nil {
-		return p.err
-	}
-	p.deleted = name
+	c.strategy = st
 	return nil
 }
 
-type stubEngine struct {
-	decision policy.Decision
-	err      error
-	seen     policy.Input
-	calls    int
+type stubMigrator struct {
+	report migrate.Report
+	err    error
+	calls  int
 }
 
-func (e *stubEngine) Execute(_ context.Context, _ policy.Policy, in policy.Input) (policy.Decision, error) {
-	e.calls++
-	e.seen = in
-	return e.decision, e.err
+func (m *stubMigrator) Migrate(context.Context) (migrate.Report, error) {
+	m.calls++
+	return m.report, m.err
 }
 
 type stubUserModels struct {
@@ -234,8 +202,7 @@ func (stubResolver) Resolve(_ context.Context, modelID string) (upstreamclient.R
 type env struct {
 	server      *httptest.Server
 	collections *stubCollections
-	policies    *stubPolicies
-	engine      *stubEngine
+	migrator    *stubMigrator
 	users       *stubUserModels
 	runStates   *stubRunStates
 	health      *stubHealth
@@ -249,26 +216,26 @@ func newEnv(t *testing.T) *env {
 	}}}
 	e := &env{
 		collections: &stubCollections{snap: snap},
-		policies:    &stubPolicies{record: policy.Policy{Name: "preset", Language: policy.LangLua, Source: "return {}", Version: 3}},
-		engine:      &stubEngine{decision: policy.Decision{Candidates: []string{"kimi-1/k3"}}},
-		users:       &stubUserModels{model: usermodel.UserModel{Name: "sonnet", Collection: "c1", ClientKey: "sk-client", Enabled: true}},
-		runStates:   &stubRunStates{},
-		health:      &stubHealth{cache: true, upstream: true},
+		migrator: &stubMigrator{report: migrate.Report{
+			Mapped:    []migrate.Mapped{{Collection: "c1", Policy: "preset"}},
+			Conflicts: []migrate.Conflict{},
+			Unmapped:  []migrate.Unmapped{},
+		}},
+		users:     &stubUserModels{model: usermodel.UserModel{Name: "sonnet", Collection: "c1", ClientKey: "sk-client", Enabled: true}},
+		runStates: &stubRunStates{},
+		health:    &stubHealth{cache: true, upstream: true},
 	}
 	srv := &Server{
 		Dispatch: &dispatch.Service{
 			UserModels:  e.users,
 			Collections: e.collections,
-			Policies:    e.policies,
-			Engine:      e.engine,
 			RunStates:   e.runStates,
 			Resolver:    stubResolver{},
 			Thresholds:  runstate.Thresholds{FailureThreshold: 3, CooldownDuration: time.Minute},
 		},
 		Health:      e.health,
 		Collections: e.collections,
-		Policies:    e.policies,
-		Engine:      e.engine,
+		Migrator:    e.migrator,
 		UserModels:  e.users,
 		RunStates:   e.runStates,
 		DispatchKey: dispatchKey,
@@ -463,6 +430,9 @@ func TestDispatchEndpointReturnsTargetAndProvenance(t *testing.T) {
 	if got.Decision.Collection != "c1" || got.Decision.Group != "primary" {
 		t.Fatalf("decision = %+v", got.Decision)
 	}
+	if len(got.Decision.Candidates) != 1 || got.Decision.Candidates[0].Phase != "standard" {
+		t.Fatalf("candidates = %+v, want one standard candidate", got.Decision.Candidates)
+	}
 }
 
 func TestDispatchEndpointMapsErrorStatus(t *testing.T) {
@@ -535,81 +505,96 @@ func TestAdminCollectionRoutes(t *testing.T) {
 	}
 }
 
-func TestAdminPolicyRoutes(t *testing.T) {
+func TestAdminStrategyRoutes(t *testing.T) {
 	e := newEnv(t)
-	cases := []struct {
-		name   string
-		method string
-		path   string
-		body   string
-		want   int
-	}{
-		{"list", http.MethodGet, "/admin/policies", "", http.StatusOK},
-		{"create", http.MethodPost, "/admin/policies", `{"name":"rr","language":"lua","source":"return {}"}`, http.StatusCreated},
-		{"get", http.MethodGet, "/admin/policies/rr", "", http.StatusOK},
-		{"update", http.MethodPut, "/admin/policies/rr", `{"language":"lua","source":"return {1}"}`, http.StatusOK},
-		{"delete", http.MethodDelete, "/admin/policies/rr", "", http.StatusNoContent},
+	resp, body := e.admin(t, http.MethodPut, "/admin/collections/c1/strategy",
+		`{"priority_chain":["primary"],"overflow":{"enabled":true,"threshold_tokens":100000,"compact_groups":["compact"]}}`)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("put status = %d, body %s", resp.StatusCode, body)
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			resp, body := e.admin(t, tc.method, tc.path, tc.body)
-			if resp.StatusCode != tc.want {
-				t.Fatalf("status = %d, want %d, body %s", resp.StatusCode, tc.want, body)
-			}
-		})
+	st := e.collections.strategy
+	if st.PriorityChain[0] != "primary" || !st.Overflow.Enabled ||
+		st.Overflow.ThresholdTokens != 100000 || st.Overflow.CompactGroups[0] != "compact" {
+		t.Fatalf("stored strategy = %+v", st)
 	}
-	if e.policies.deleted != "rr" {
-		t.Fatalf("deleted = %q", e.policies.deleted)
+
+	resp, body = e.admin(t, http.MethodGet, "/admin/collections/c1/strategy", "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("get status = %d, body %s", resp.StatusCode, body)
+	}
+	if !strings.Contains(body, `"threshold_tokens":100000`) {
+		t.Fatalf("body = %s, want the stored strategy back", body)
 	}
 }
 
-func TestDeletePolicyConflictListsReferences(t *testing.T) {
+func TestAdminStrategyValidationErrorMapsTo400(t *testing.T) {
 	e := newEnv(t)
-	e.policies.err = apperr.New(apperr.Conflict, `policy "preset" is bound to user models: sonnet, opus`)
-	resp, body := e.admin(t, http.MethodDelete, "/admin/policies/preset", "")
-	if resp.StatusCode != http.StatusConflict {
-		t.Fatalf("status = %d, want 409", resp.StatusCode)
-	}
-	for _, want := range []string{"sonnet", "opus"} {
-		if !strings.Contains(body, want) {
-			t.Fatalf("body %s missing referencing user model %q", body, want)
-		}
+	e.collections.err = apperr.Field(apperr.InvalidRequest, "priority_chain", `group "ghost" does not exist`)
+	resp, _ := e.admin(t, http.MethodPut, "/admin/collections/c1/strategy",
+		`{"priority_chain":["ghost"]}`)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
 	}
 }
 
-// TestDryRunIsIsolated 断言试运行只读快照：不加载运行态、不解析目标。
-func TestDryRunIsIsolated(t *testing.T) {
+// TestStrategyDryRunSharesComposeCore 试运行与真实调度共用 compose 核：
+// 看到的序列就是上线后的序列，且不产生任何上游流量。
+func TestStrategyDryRunSharesComposeCore(t *testing.T) {
 	e := newEnv(t)
-	resp, body := e.admin(t, http.MethodPost, "/admin/policies/preset/dry-run",
-		`{"collection":"c1","request":{"user_model":"sonnet","est_tokens":100},
-		  "runtime":{"kimi-1/k3":{"cooling":true,"consecutive_failures":9}}}`)
+	resp, body := e.admin(t, http.MethodPost, "/admin/collections/c1/strategy/dry-run",
+		`{"est_tokens":100}`)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, body %s", resp.StatusCode, body)
 	}
-	if e.engine.calls != 1 {
-		t.Fatalf("engine calls = %d, want 1", e.engine.calls)
-	}
-	if !strings.Contains(body, `"policy":"preset"`) || !strings.Contains(body, `"policy_version":3`) {
-		t.Fatalf("body = %s, want policy provenance", body)
-	}
-	// 传入的运行态被原样交给脚本，而不是从库里读真实状态。
-	if st := e.engine.seen.Runtime["kimi-1/k3"]; !st.Cooling || st.ConsecutiveFailures != 9 {
-		t.Fatalf("runtime input = %+v, dry-run must use the supplied state", st)
+	if !strings.Contains(body, `"kimi-1/k3"`) || !strings.Contains(body, `"standard"`) {
+		t.Fatalf("body = %s, want the composed sequence", body)
 	}
 	if e.runStates.resetID != "" {
 		t.Fatal("dry-run must not touch runtime state")
 	}
 }
 
-func TestDryRunSurfacesPolicyError(t *testing.T) {
+func TestMigratePoliciesReturnsReport(t *testing.T) {
 	e := newEnv(t)
-	e.engine.err = apperr.New(apperr.PolicyError, "attempt to index a nil value")
-	resp, body := e.admin(t, http.MethodPost, "/admin/policies/preset/dry-run", `{"collection":"c1"}`)
-	if resp.StatusCode != http.StatusInternalServerError {
-		t.Fatalf("status = %d, want 500", resp.StatusCode)
+	resp, body := e.admin(t, http.MethodPost, "/admin/migrate-policies", "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body %s", resp.StatusCode, body)
 	}
-	if !strings.Contains(body, "policy_error") {
-		t.Fatalf("body = %s", body)
+	if e.migrator.calls != 1 {
+		t.Fatalf("migrator calls = %d, want 1", e.migrator.calls)
+	}
+	if !strings.Contains(body, `"mapped"`) || !strings.Contains(body, `"preset"`) {
+		t.Fatalf("body = %s, want the migration report", body)
+	}
+}
+
+// TestMigratePoliciesWithoutMigrator 未接线的部署不该 500，而是明说功能不可用。
+func TestMigratePoliciesWithoutMigrator(t *testing.T) {
+	e := newEnv(t)
+	srv := &Server{Health: e.health, AdminKey: adminKey, DispatchKey: dispatchKey}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/admin/migrate-policies", nil)
+	req.Header.Set("Authorization", "Bearer "+adminKey)
+	resp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", resp.StatusCode)
+	}
+}
+
+// TestPolicyRoutesAreGone 脚本策略的管理面整体下线，旧路径必须 404，
+// 而不是静默漏到别的 handler 上。
+func TestPolicyRoutesAreGone(t *testing.T) {
+	e := newEnv(t)
+	for _, path := range []string{"/admin/policies", "/admin/policies/preset", "/admin/policies/preset/dry-run"} {
+		resp, _ := e.admin(t, http.MethodGet, path, "")
+		if resp.StatusCode != http.StatusNotFound && resp.StatusCode != http.StatusMethodNotAllowed {
+			t.Fatalf("%s status = %d, want 404/405", path, resp.StatusCode)
+		}
 	}
 }
 
@@ -624,7 +609,7 @@ func TestAdminUserModelRoutes(t *testing.T) {
 	}{
 		{"list", http.MethodGet, "/admin/user-models", "", http.StatusOK},
 		{"create", http.MethodPost, "/admin/user-models",
-			`{"name":"opus","collection":"c1","policy":"preset","client_key":"sk","enabled":true}`, http.StatusCreated},
+			`{"name":"opus","collection":"c1","client_key":"sk","enabled":true}`, http.StatusCreated},
 		{"get", http.MethodGet, "/admin/user-models/opus", "", http.StatusOK},
 		{"update", http.MethodPut, "/admin/user-models/opus",
 			`{"collection":"c1","client_key":"sk2","enabled":false}`, http.StatusOK},

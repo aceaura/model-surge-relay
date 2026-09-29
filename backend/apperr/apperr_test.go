@@ -9,9 +9,7 @@ import (
 func TestRetryability(t *testing.T) {
 	cases := map[Code]bool{
 		TargetUnavailable: true,
-		PolicyTimeout:     true,
 		Internal:          true,
-		PolicyError:       false,
 		Unauthorized:      false,
 		NotFound:          false,
 		InvalidRequest:    false,
@@ -33,8 +31,6 @@ func TestStatusMapping(t *testing.T) {
 		Conflict:          http.StatusConflict,
 		Disabled:          http.StatusForbidden,
 		TargetUnavailable: http.StatusServiceUnavailable,
-		PolicyTimeout:     http.StatusServiceUnavailable,
-		PolicyError:       http.StatusInternalServerError,
 		Internal:          http.StatusInternalServerError,
 	}
 	for code, want := range cases {

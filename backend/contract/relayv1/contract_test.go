@@ -109,13 +109,18 @@ func TestTargetFromResolvedCopiesEveryField(t *testing.T) {
 
 func TestDecisionCarriesFullProvenance(t *testing.T) {
 	d := Decision{
-		Policy:        "least-used",
-		PolicyVersion: 7,
-		Collection:    "c1",
-		Group:         "backup",
-		GroupType:     "cheap",
-		Note:          "picked lowest usage",
-		Candidates:    []string{"ark-1/ds", "ark-2/ds"},
+		Collection:          "c1",
+		CollectionUpdatedAt: time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC),
+		Group:               "backup",
+		GroupType:           "cheap",
+		Note:                "overflow=compact:2,resume:3",
+		Candidates: []PhasedCandidate{
+			{ModelID: "ark-1/ds", Phase: "standard"},
+			{ModelID: "ark-2/ds", Phase: "compact"},
+		},
+		GroupSkips: []GroupSkip{
+			{Group: "premium", Reason: "group_exhausted", Detail: "全部 2 个成员不可用"},
+		},
 		Skipped: []Skip{
 			{ModelID: "kimi-1/k3", Reason: SkipCooling},
 			{ModelID: "kimi-2/k3", Reason: SkipResolveFailed, Detail: "upstream 503"},
@@ -130,8 +135,8 @@ func TestDecisionCarriesFullProvenance(t *testing.T) {
 		t.Fatalf("unmarshal: %v", err)
 	}
 	for _, key := range []string{
-		"policy", "policy_version", "collection", "group",
-		"group_type", "note", "candidates", "skipped",
+		"collection", "collection_updated_at", "group",
+		"group_type", "note", "candidates", "group_skips", "skipped",
 	} {
 		if _, ok := got[key]; !ok {
 			t.Errorf("field %q missing from %s", key, raw)
@@ -139,13 +144,32 @@ func TestDecisionCarriesFullProvenance(t *testing.T) {
 	}
 }
 
-func TestDecisionOmitsPolicyProvenanceOnFallback(t *testing.T) {
-	raw, err := json.Marshal(Decision{Collection: "c1", Group: "g", GroupType: "t", Candidates: []string{}})
+// TestDecisionOmitsEmptyOptionalSections 溯源字段缺省时不该在载荷里留垃圾键。
+func TestDecisionOmitsEmptyOptionalSections(t *testing.T) {
+	raw, err := json.Marshal(Decision{
+		Collection: "c1", Group: "g", GroupType: "t",
+		Candidates: []PhasedCandidate{},
+	})
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	if strings.Contains(string(raw), "policy") {
-		t.Fatalf("fallback decision should not claim a policy: %s", raw)
+	for _, key := range []string{"collection_updated_at", "group_skips", "skipped"} {
+		if strings.Contains(string(raw), key) {
+			t.Fatalf("empty section %q leaked into payload: %s", key, raw)
+		}
+	}
+}
+
+// TestPhasedCandidateShape 钉住线上的字面值：agent 按字符串比较阶段，
+// 改词就是破坏性变更。
+func TestPhasedCandidateShape(t *testing.T) {
+	raw, err := json.Marshal(PhasedCandidate{ModelID: "kimi-1/k3", Phase: "resume"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	const want = `{"model_id":"kimi-1/k3","phase":"resume"}`
+	if string(raw) != want {
+		t.Fatalf("phased candidate = %s, want %s", raw, want)
 	}
 }
 
@@ -153,7 +177,7 @@ func TestDispatchResponseStringRedactsCredentials(t *testing.T) {
 	resp := DispatchResponse{
 		RequestID: "req-1",
 		Target:    fullTarget(),
-		Decision:  Decision{Collection: "c1", Candidates: []string{"kimi-1/k3"}},
+		Decision:  Decision{Collection: "c1", Candidates: []PhasedCandidate{{ModelID: "kimi-1/k3", Phase: "standard"}}},
 	}
 	if strings.Contains(resp.String(), "sk-secret-value-1234") {
 		t.Fatalf("String() leaks the credential: %s", resp)

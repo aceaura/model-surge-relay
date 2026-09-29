@@ -88,16 +88,32 @@ type Skip struct {
 	Detail  string `json:"detail,omitempty"`
 }
 
-// Decision 是决策溯源。Policy 为空表示走了兜底顺序。
+// PhasedCandidate 是阶段化候选：agent 按序执行、不问语义——
+// compact 段做压缩请求，resume 段在压缩后继续原任务，standard 是
+// 未触发超长时的唯一段。阶段取值与 strategy 包常量一致，契约自持
+// 不import内部包：线上字节流不能随内部重构漂移。
+type PhasedCandidate struct {
+	ModelID string `json:"model_id"`
+	Phase   string `json:"phase"` // standard | compact | resume
+}
+
+// GroupSkip 记录一次整组跳过（组内成员全部不可用，含限额冷却）。
+type GroupSkip struct {
+	Group  string `json:"group"`
+	Reason string `json:"reason"` // group_exhausted
+	Detail string `json:"detail,omitempty"`
+}
+
+// Decision 是决策溯源。CollectionUpdatedAt 关联做出本次决策的策略组合版本。
 type Decision struct {
-	Policy        string   `json:"policy,omitempty"`
-	PolicyVersion int      `json:"policy_version,omitempty"`
-	Collection    string   `json:"collection"`
-	Group         string   `json:"group"`
-	GroupType     string   `json:"group_type"`
-	Note          string   `json:"note,omitempty"`
-	Candidates    []string `json:"candidates"`
-	Skipped       []Skip   `json:"skipped,omitempty"`
+	Collection          string            `json:"collection"`
+	CollectionUpdatedAt time.Time         `json:"collection_updated_at,omitzero"`
+	Group               string            `json:"group"`
+	GroupType           string            `json:"group_type"`
+	Note                string            `json:"note,omitempty"`
+	Candidates          []PhasedCandidate `json:"candidates"`
+	GroupSkips          []GroupSkip       `json:"group_skips,omitempty"`
+	Skipped             []Skip            `json:"skipped,omitempty"`
 }
 
 type DispatchResponse struct {
@@ -153,7 +169,6 @@ type ReportResponse struct {
 type UserModelSummary struct {
 	Name       string `json:"name"`
 	Collection string `json:"collection"`
-	Policy     string `json:"policy,omitempty"`
 	Protocol   string `json:"protocol,omitempty"`
 	Enabled    bool   `json:"enabled"`
 }

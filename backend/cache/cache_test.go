@@ -230,7 +230,7 @@ func TestReadyReflectsBackend(t *testing.T) {
 }
 
 func TestKeyspaceIsNamespaced(t *testing.T) {
-	cases := []string{CollectionKey("c"), UserModelKey("u"), PolicyKey("p"), CatalogKey()}
+	cases := []string{CollectionKey("c"), UserModelKey("u"), CatalogKey()}
 	seen := map[string]bool{}
 	for _, k := range cases {
 		if len(k) < len(prefix) || k[:len(prefix)] != prefix {

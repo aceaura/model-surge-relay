@@ -1,6 +1,6 @@
-// Package dispatch 编排一次调度：鉴权 → 快照 → 运行态 → 策略 → 过滤 → 解析。
+// Package dispatch 编排一次调度：鉴权 → 快照 → 运行态 → 组合器 → 解析。
 //
-// 凭据只在最后一步的解析里出现，且不回流到策略层，这条顺序是设计约束而非实现巧合。
+// 凭据只在最后一步的解析里出现，且不回流到决策逻辑，这条顺序是设计约束而非实现巧合。
 package dispatch
 
 import (
@@ -12,8 +12,8 @@ import (
 	"github.com/aceaura/model-surge-relay/backend/apperr"
 	"github.com/aceaura/model-surge-relay/backend/collection"
 	"github.com/aceaura/model-surge-relay/backend/contract/relayv1"
-	"github.com/aceaura/model-surge-relay/backend/policy"
 	"github.com/aceaura/model-surge-relay/backend/runstate"
+	"github.com/aceaura/model-surge-relay/backend/strategy"
 	"github.com/aceaura/model-surge-relay/backend/upstreamclient"
 	"github.com/aceaura/model-surge-relay/backend/usermodel"
 )
@@ -25,14 +25,6 @@ type UserModels interface {
 
 type Collections interface {
 	Snapshot(ctx context.Context, name string) (collection.Snapshot, error)
-}
-
-type Policies interface {
-	Get(ctx context.Context, name string) (policy.Policy, error)
-}
-
-type PolicyEngine interface {
-	Execute(ctx context.Context, p policy.Policy, in policy.Input) (policy.Decision, error)
 }
 
 type RunStates interface {
@@ -52,10 +44,9 @@ type Logger interface {
 type LogEntry struct {
 	RequestID     string
 	UserModel     string
-	Policy        string
-	PolicyVersion int
 	Candidates    int
 	Selected      string
+	SelectedPhase string
 	Skipped       []relayv1.Skip
 	Duration      time.Duration
 	Error         string
@@ -64,8 +55,6 @@ type LogEntry struct {
 type Service struct {
 	UserModels  UserModels
 	Collections Collections
-	Policies    Policies
-	Engine      PolicyEngine
 	RunStates   RunStates
 	Resolver    Resolver
 	Thresholds  runstate.Thresholds
@@ -94,76 +83,35 @@ func (s *Service) dispatch(ctx context.Context, req relayv1.DispatchRequest, ent
 		return relayv1.DispatchResponse{}, err
 	}
 
-	snap, err := s.Collections.Snapshot(ctx, um.Collection)
+	snap, decision, cands, err := s.compose(ctx, um.Collection, req.EstTokens, req.TriedIDs)
 	if err != nil {
 		return relayv1.DispatchResponse{}, err
 	}
+	entry.Candidates = len(cands)
 
-	states, err := s.RunStates.Load(ctx, allMembers(snap))
-	if err != nil {
-		return relayv1.DispatchResponse{}, err
-	}
-
-	decision := relayv1.Decision{Collection: um.Collection, Candidates: []string{}}
-	var candidates []string
-	if um.Policy == "" {
-		candidates = fallbackOrder(snap)
-	} else {
-		p, err := s.Policies.Get(ctx, um.Policy)
-		if err != nil {
-			return relayv1.DispatchResponse{}, err
-		}
-		decision.Policy = p.Name
-		decision.PolicyVersion = p.Version
-		entry.Policy = p.Name
-		entry.PolicyVersion = p.Version
-
-		// 恰好执行一次：失败即整体失败，不重试、不回退到兜底顺序。
-		out, err := s.Engine.Execute(ctx, p, policy.Input{
-			Request: policy.RequestContext{
-				UserModel:       req.Model,
-				InboundProtocol: req.InboundProtocol,
-				EstTokens:       req.EstTokens,
-				TriedIDs:        req.TriedIDs,
-				RequestID:       req.RequestID,
-			},
-			Collection: snap,
-			Runtime:    policyStates(states),
-		})
-		if err != nil {
-			return relayv1.DispatchResponse{}, err
-		}
-		candidates = out.Candidates
-		decision.Note = out.Note
-	}
-
-	kept, skipped := filterCandidates(candidates, snap, states, req.TriedIDs)
-	decision.Skipped = skipped
-	decision.Candidates = kept
-	entry.Candidates = len(kept)
-	entry.Skipped = skipped
-
-	if len(kept) == 0 {
+	if len(cands) == 0 {
 		// 空列表不发起解析：没有目标可解析，也不该去打扰上游。
+		entry.Skipped = decision.Skipped
 		return relayv1.DispatchResponse{}, apperr.New(apperr.TargetUnavailable,
 			fmt.Sprintf("no eligible target for user model %q", req.Model))
 	}
 
-	for _, id := range kept {
-		target, err := s.Resolver.Resolve(ctx, id)
+	for _, c := range cands {
+		target, err := s.Resolver.Resolve(ctx, c.ModelID)
 		if err != nil {
 			decision.Skipped = append(decision.Skipped, relayv1.Skip{
-				ModelID: id,
+				ModelID: c.ModelID,
 				Reason:  relayv1.SkipResolveFailed,
 				Detail:  apperr.From(err).Message,
 			})
 			continue
 		}
-		if g, ok := snap.Locate(id); ok {
+		if g, ok := snap.Locate(c.ModelID); ok {
 			decision.Group = g.Name
 			decision.GroupType = g.Type
 		}
-		entry.Selected = id
+		entry.Selected = c.ModelID
+		entry.SelectedPhase = c.Phase
 		entry.Skipped = decision.Skipped
 		return relayv1.DispatchResponse{
 			RequestID: req.RequestID,
@@ -174,7 +122,54 @@ func (s *Service) dispatch(ctx context.Context, req relayv1.DispatchRequest, ent
 
 	entry.Skipped = decision.Skipped
 	return relayv1.DispatchResponse{}, apperr.New(apperr.TargetUnavailable,
-		fmt.Sprintf("all %d candidates failed to resolve: %s", len(kept), summarize(decision.Skipped)))
+		fmt.Sprintf("all %d candidates failed to resolve: %s", len(cands), summarize(decision.Skipped)))
+}
+
+// compose 是决策公共核：快照 → 运行态 → 组合器。Dispatch 与 DryRun 共用，
+// 试运行与真实调度看到完全一致的序列。
+func (s *Service) compose(
+	ctx context.Context,
+	collectionName string,
+	estTokens int,
+	triedIDs []string,
+) (collection.Snapshot, relayv1.Decision, []strategy.Candidate, error) {
+	snap, err := s.Collections.Snapshot(ctx, collectionName)
+	if err != nil {
+		return collection.Snapshot{}, relayv1.Decision{}, nil, err
+	}
+	states, err := s.RunStates.Load(ctx, allMembers(snap))
+	if err != nil {
+		return collection.Snapshot{}, relayv1.Decision{}, nil, err
+	}
+
+	cands, memberSkips, groupSkips := strategy.Compose(
+		snapshotGroups(snap), states, triedIDs, estTokens, snap.Strategy)
+
+	decision := relayv1.Decision{
+		Collection:          collectionName,
+		CollectionUpdatedAt: snap.UpdatedAt,
+		Candidates:          make([]relayv1.PhasedCandidate, 0, len(cands)),
+		Skipped:             make([]relayv1.Skip, 0, len(memberSkips)),
+	}
+	for _, c := range cands {
+		decision.Candidates = append(decision.Candidates,
+			relayv1.PhasedCandidate{ModelID: c.ModelID, Phase: c.Phase})
+	}
+	for _, ms := range memberSkips {
+		decision.Skipped = append(decision.Skipped,
+			relayv1.Skip{ModelID: ms.ModelID, Reason: ms.Reason, Detail: "group " + ms.Group})
+	}
+	for _, gs := range groupSkips {
+		decision.GroupSkips = append(decision.GroupSkips,
+			relayv1.GroupSkip{Group: gs.Group, Reason: gs.Reason, Detail: gs.Detail})
+	}
+	return snap, decision, cands, nil
+}
+
+// DryRun 试运行：输出与真实调度一致的阶段化序列，但不解析目标、不写运行态。
+func (s *Service) DryRun(ctx context.Context, collectionName string, estTokens int, triedIDs []string) (relayv1.Decision, error) {
+	_, decision, _, err := s.compose(ctx, collectionName, estTokens, triedIDs)
+	return decision, err
 }
 
 func (s *Service) Report(ctx context.Context, rep relayv1.ResultReport) (relayv1.ReportResponse, error) {
@@ -206,7 +201,6 @@ func (s *Service) Models(ctx context.Context) (relayv1.ModelsResponse, error) {
 		out.Models = append(out.Models, relayv1.UserModelSummary{
 			Name:       m.Name,
 			Collection: m.Collection,
-			Policy:     m.Policy,
 			Protocol:   m.Protocol,
 			Enabled:    m.Enabled,
 		})
@@ -230,20 +224,19 @@ func allMembers(snap collection.Snapshot) []string {
 	return out
 }
 
-func policyStates(states map[string]runstate.State) map[string]policy.State {
-	out := make(map[string]policy.State, len(states))
-	for id, s := range states {
-		ps := policy.State{
-			Cooling:             s.Cooling,
-			ConsecutiveFailures: s.ConsecutiveFailures,
-			InputTokens:         s.Usage.InputTokens,
-			OutputTokens:        s.Usage.OutputTokens,
-			RequestCount:        s.Usage.RequestCount,
+// snapshotGroups 把调度快照适配成组合器视图：只带可用性判定需要的三位。
+func snapshotGroups(snap collection.Snapshot) []strategy.Group {
+	out := make([]strategy.Group, 0, len(snap.Groups))
+	for _, g := range snap.Groups {
+		members := make([]strategy.Member, 0, len(g.Members))
+		for _, m := range g.Members {
+			members = append(members, strategy.Member{
+				ModelID: m.ModelID,
+				Known:   m.Known,
+				Enabled: m.Enabled,
+			})
 		}
-		if s.Cooling {
-			ps.CoolingUntil = s.CoolingUntil.Unix()
-		}
-		out[id] = ps
+		out = append(out, strategy.Group{Name: g.Name, Members: members})
 	}
 	return out
 }

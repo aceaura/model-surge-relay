@@ -28,12 +28,13 @@ func (r *Repo) Create(ctx context.Context, m UserModel) (UserModel, error) {
 		return UserModel{}, err
 	}
 	var out UserModel
+	// policy 列物理保留供一次性迁移反查，写入面一律 NULL（见 schema 注释）。
 	err := r.pool.QueryRow(ctx,
-		`INSERT INTO user_models (name, collection, policy, client_key, protocol, enabled)
-		 VALUES ($1, $2, $3, $4, $5, $6)
-		 RETURNING name, collection, coalesce(policy, ''), client_key, protocol, enabled, created_at, updated_at`,
-		m.Name, m.Collection, nullable(m.Policy), m.ClientKey, m.Protocol, m.Enabled).
-		Scan(&out.Name, &out.Collection, &out.Policy, &out.ClientKey, &out.Protocol, &out.Enabled,
+		`INSERT INTO user_models (name, collection, client_key, protocol, enabled)
+		 VALUES ($1, $2, $3, $4, $5)
+		 RETURNING name, collection, client_key, protocol, enabled, created_at, updated_at`,
+		m.Name, m.Collection, m.ClientKey, m.Protocol, m.Enabled).
+		Scan(&out.Name, &out.Collection, &out.ClientKey, &out.Protocol, &out.Enabled,
 			&out.CreatedAt, &out.UpdatedAt)
 	if err != nil {
 		return UserModel{}, mapWriteError(err, m)
@@ -41,7 +42,7 @@ func (r *Repo) Create(ctx context.Context, m UserModel) (UserModel, error) {
 	return out, nil
 }
 
-// Update 整体替换可变字段。Collection 与 policy 的存在性由外键把关，
+// Update 整体替换可变字段。Collection 的存在性由外键把关，
 // 违约转成可读的 invalid_request。
 func (r *Repo) Update(ctx context.Context, m UserModel) (UserModel, error) {
 	if err := validate(m); err != nil {
@@ -49,12 +50,12 @@ func (r *Repo) Update(ctx context.Context, m UserModel) (UserModel, error) {
 	}
 	var out UserModel
 	err := r.pool.QueryRow(ctx,
-		`UPDATE user_models SET collection = $2, policy = $3, client_key = $4,
-		   protocol = $5, enabled = $6, updated_at = now()
+		`UPDATE user_models SET collection = $2, client_key = $3,
+		   protocol = $4, enabled = $5, updated_at = now()
 		 WHERE name = $1
-		 RETURNING name, collection, coalesce(policy, ''), client_key, protocol, enabled, created_at, updated_at`,
-		m.Name, m.Collection, nullable(m.Policy), m.ClientKey, m.Protocol, m.Enabled).
-		Scan(&out.Name, &out.Collection, &out.Policy, &out.ClientKey, &out.Protocol, &out.Enabled,
+		 RETURNING name, collection, client_key, protocol, enabled, created_at, updated_at`,
+		m.Name, m.Collection, m.ClientKey, m.Protocol, m.Enabled).
+		Scan(&out.Name, &out.Collection, &out.ClientKey, &out.Protocol, &out.Enabled,
 			&out.CreatedAt, &out.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return UserModel{}, apperr.New(apperr.NotFound, fmt.Sprintf("user model %q not found", m.Name))
@@ -94,9 +95,9 @@ func (r *Repo) Get(ctx context.Context, name string) (UserModel, error) {
 func (r *Repo) load(ctx context.Context, name string) (UserModel, error) {
 	var out UserModel
 	err := r.pool.QueryRow(ctx,
-		`SELECT name, collection, coalesce(policy, ''), client_key, protocol, enabled, created_at, updated_at
+		`SELECT name, collection, client_key, protocol, enabled, created_at, updated_at
 		 FROM user_models WHERE name = $1`, name).
-		Scan(&out.Name, &out.Collection, &out.Policy, &out.ClientKey, &out.Protocol, &out.Enabled,
+		Scan(&out.Name, &out.Collection, &out.ClientKey, &out.Protocol, &out.Enabled,
 			&out.CreatedAt, &out.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return UserModel{}, apperr.New(apperr.NotFound, fmt.Sprintf("user model %q not found", name))
@@ -109,7 +110,7 @@ func (r *Repo) load(ctx context.Context, name string) (UserModel, error) {
 
 func (r *Repo) List(ctx context.Context) ([]UserModel, error) {
 	rows, err := r.pool.Query(ctx,
-		`SELECT name, collection, coalesce(policy, ''), client_key, protocol, enabled, created_at, updated_at
+		`SELECT name, collection, client_key, protocol, enabled, created_at, updated_at
 		 FROM user_models ORDER BY name`)
 	if err != nil {
 		return nil, err
@@ -118,7 +119,7 @@ func (r *Repo) List(ctx context.Context) ([]UserModel, error) {
 	out := []UserModel{}
 	for rows.Next() {
 		var m UserModel
-		if err := rows.Scan(&m.Name, &m.Collection, &m.Policy, &m.ClientKey, &m.Protocol, &m.Enabled,
+		if err := rows.Scan(&m.Name, &m.Collection, &m.ClientKey, &m.Protocol, &m.Enabled,
 			&m.CreatedAt, &m.UpdatedAt); err != nil {
 			return nil, err
 		}
@@ -174,13 +175,6 @@ func validate(m UserModel) error {
 	return nil
 }
 
-func nullable(s string) any {
-	if s == "" {
-		return nil
-	}
-	return s
-}
-
 // mapWriteError 把外键与唯一约束翻译成指向具体字段的校验错误。
 // 约束名是判别依据：两个外键都可能违约，报错必须指对那一个。
 func mapWriteError(err error, m UserModel) error {
@@ -192,10 +186,6 @@ func mapWriteError(err error, m UserModel) error {
 	case "23505":
 		return apperr.New(apperr.Conflict, fmt.Sprintf("user model %q already exists", m.Name))
 	case "23503":
-		if strings.Contains(pgErr.ConstraintName, "policy") {
-			return apperr.Field(apperr.InvalidRequest, "policy",
-				fmt.Sprintf("policy %q does not exist", m.Policy))
-		}
 		return apperr.Field(apperr.InvalidRequest, "collection",
 			fmt.Sprintf("collection %q does not exist", m.Collection))
 	default:

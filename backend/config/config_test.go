@@ -25,9 +25,6 @@ func TestLoadAppliesDefaults(t *testing.T) {
 	if cfg.CacheTTL != defaultCacheTTL {
 		t.Errorf("cache ttl = %s, want %s", cfg.CacheTTL, defaultCacheTTL)
 	}
-	if cfg.PolicyTimeout != defaultPolicyTimeout {
-		t.Errorf("policy timeout = %s, want %s", cfg.PolicyTimeout, defaultPolicyTimeout)
-	}
 	if cfg.CooldownThreshold != defaultCooldownThreshold {
 		t.Errorf("threshold = %d, want %d", cfg.CooldownThreshold, defaultCooldownThreshold)
 	}
@@ -42,7 +39,6 @@ func TestLoadAppliesDefaults(t *testing.T) {
 func TestLoadReadsOverrides(t *testing.T) {
 	setRequired(t)
 	t.Setenv("MSR_CACHE_TTL", "30s")
-	t.Setenv("MSR_POLICY_TIMEOUT", "500ms")
 	t.Setenv("MSR_COOLDOWN_THRESHOLD", "5")
 	t.Setenv("MSR_COOLDOWN_DURATION", "2m")
 	t.Setenv("MSR_LISTEN", ":9090")
@@ -53,7 +49,7 @@ func TestLoadReadsOverrides(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if cfg.CacheTTL != 30*time.Second || cfg.PolicyTimeout != 500*time.Millisecond ||
+	if cfg.CacheTTL != 30*time.Second ||
 		cfg.CooldownThreshold != 5 || cfg.CooldownDuration != 2*time.Minute ||
 		cfg.Listen != ":9090" || cfg.RedisDB != 3 {
 		t.Fatalf("config = %+v", cfg)
@@ -99,9 +95,9 @@ func TestLoadRejectsIdenticalKeys(t *testing.T) {
 
 func TestLoadRejectsMalformedDuration(t *testing.T) {
 	setRequired(t)
-	t.Setenv("MSR_POLICY_TIMEOUT", "soon")
+	t.Setenv("MSR_COOLDOWN_DURATION", "soon")
 	_, err := Load()
-	if err == nil || !strings.Contains(err.Error(), "MSR_POLICY_TIMEOUT") {
+	if err == nil || !strings.Contains(err.Error(), "MSR_COOLDOWN_DURATION") {
 		t.Fatalf("error = %v", err)
 	}
 }

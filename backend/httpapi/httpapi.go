@@ -15,8 +15,9 @@ import (
 	"github.com/aceaura/model-surge-relay/backend/collection"
 	"github.com/aceaura/model-surge-relay/backend/contract/relayv1"
 	"github.com/aceaura/model-surge-relay/backend/dispatch"
-	"github.com/aceaura/model-surge-relay/backend/policy"
+	"github.com/aceaura/model-surge-relay/backend/migrate"
 	"github.com/aceaura/model-surge-relay/backend/runstate"
+	"github.com/aceaura/model-surge-relay/backend/strategy"
 	"github.com/aceaura/model-surge-relay/backend/usermodel"
 )
 
@@ -39,18 +40,13 @@ type Collections interface {
 	Groups(ctx context.Context, collectionName string) ([]collection.Group, error)
 	ReplaceMembers(ctx context.Context, collectionName, groupName string, modelIDs []string) error
 	Snapshot(ctx context.Context, name string) (collection.Snapshot, error)
+	SetStrategy(ctx context.Context, name string, st strategy.Strategy) error
 }
 
-type Policies interface {
-	Create(ctx context.Context, p policy.Policy) (policy.Policy, error)
-	Update(ctx context.Context, p policy.Policy) (policy.Policy, error)
-	Get(ctx context.Context, name string) (policy.Policy, error)
-	List(ctx context.Context) ([]policy.Policy, error)
-	Delete(ctx context.Context, name string) error
-}
-
-type PolicyEngine interface {
-	Execute(ctx context.Context, p policy.Policy, in policy.Input) (policy.Decision, error)
+// PolicyMigrator 是一次性迁移入口：把存量脚本策略翻译成集合上的组合配置。
+// 实现可空——未接线时管理面返回 409，而不是把入口藏起来。
+type PolicyMigrator interface {
+	Migrate(ctx context.Context) (migrate.Report, error)
 }
 
 type UserModels interface {
@@ -70,8 +66,7 @@ type Server struct {
 	Dispatch    *dispatch.Service
 	Health      Health
 	Collections Collections
-	Policies    Policies
-	Engine      PolicyEngine
+	Migrator    PolicyMigrator
 	UserModels  UserModels
 	RunStates   RunStates
 	DispatchKey string

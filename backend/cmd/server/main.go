@@ -16,8 +16,7 @@ import (
 	"github.com/aceaura/model-surge-relay/backend/config"
 	"github.com/aceaura/model-surge-relay/backend/dispatch"
 	"github.com/aceaura/model-surge-relay/backend/httpapi"
-	"github.com/aceaura/model-surge-relay/backend/policy"
-	"github.com/aceaura/model-surge-relay/backend/policy/runtime"
+	"github.com/aceaura/model-surge-relay/backend/migrate"
 	"github.com/aceaura/model-surge-relay/backend/runstate"
 	"github.com/aceaura/model-surge-relay/backend/store"
 	"github.com/aceaura/model-surge-relay/backend/upstreamclient"
@@ -59,21 +58,14 @@ func run(log *slog.Logger) error {
 	c := cache.New(backend, cfg.CacheTTL)
 
 	upstream := upstreamclient.New(cfg.UpstreamBaseURL, cfg.UpstreamDeliveryKey)
-	engine := policy.NewEngine(
-		policy.NewRegistry(runtime.NewLua(), runtime.NewJavaScript(), runtime.NewTypeScript()),
-		cfg.PolicyTimeout,
-	)
 
 	collections := collection.NewRepo(st.Pool(), c, upstream)
-	policies := policy.NewRepo(st.Pool(), c, engine)
 	userModels := usermodel.NewRepo(st.Pool(), c)
 	runStates := runstate.NewRepo(st.Pool())
 
 	svc := &dispatch.Service{
 		UserModels:  userModels,
 		Collections: collections,
-		Policies:    policies,
-		Engine:      engine,
 		RunStates:   runStates,
 		Resolver:    upstream,
 		Thresholds: runstate.Thresholds{
@@ -87,8 +79,7 @@ func run(log *slog.Logger) error {
 		Dispatch:    svc,
 		Health:      health{store: st, cache: c, upstream: upstream},
 		Collections: collections,
-		Policies:    policies,
-		Engine:      engine,
+		Migrator:    migrate.New(st.Pool(), collections),
 		UserModels:  userModels,
 		RunStates:   runStates,
 		DispatchKey: cfg.DispatchKey,

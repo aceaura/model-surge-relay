@@ -28,16 +28,15 @@ func TestDispatchedLogCarriesEveryField(t *testing.T) {
 	got, raw := captureLog(t, dispatch.LogEntry{
 		RequestID:     "req-1",
 		UserModel:     "sonnet",
-		Policy:        "least-used",
-		PolicyVersion: 7,
 		Candidates:    2,
 		Selected:      "kimi-1/k3",
+		SelectedPhase: "standard",
 		Skipped:       []relayv1.Skip{{ModelID: "kimi-2/k3", Reason: relayv1.SkipCooling}},
 		Duration:      12 * time.Millisecond,
 	})
 	for _, key := range []string{
-		"request_id", "user_model", "policy", "policy_version",
-		"candidates", "selected", "skipped", "duration_ms",
+		"request_id", "user_model",
+		"candidates", "selected", "phase", "skipped", "duration_ms",
 	} {
 		if _, ok := got[key]; !ok {
 			t.Errorf("field %q missing from %s", key, raw)
@@ -45,6 +44,9 @@ func TestDispatchedLogCarriesEveryField(t *testing.T) {
 	}
 	if got["level"] != "INFO" {
 		t.Errorf("level = %v, want INFO", got["level"])
+	}
+	if got["phase"] != "standard" {
+		t.Errorf("phase = %v, want standard", got["phase"])
 	}
 	if got["duration_ms"] != float64(12) {
 		t.Errorf("duration_ms = %v, want 12", got["duration_ms"])
@@ -54,28 +56,15 @@ func TestDispatchedLogCarriesEveryField(t *testing.T) {
 	}
 }
 
-func TestDispatchedLogOmitsPolicyOnFallback(t *testing.T) {
-	got, raw := captureLog(t, dispatch.LogEntry{
-		RequestID: "req-1", UserModel: "sonnet", Candidates: 1, Selected: "kimi-1/k3",
-	})
-	if _, ok := got["policy"]; ok {
-		t.Fatalf("fallback dispatch should not claim a policy: %s", raw)
-	}
-}
-
 func TestFailedDispatchLogsAtErrorLevel(t *testing.T) {
 	got, raw := captureLog(t, dispatch.LogEntry{
 		RequestID: "req-1", UserModel: "sonnet",
-		Policy: "broken", PolicyVersion: 2,
-		Error: "policy_error: attempt to index a nil value",
+		Error: "target_unavailable: no eligible target",
 	})
 	if got["level"] != "ERROR" {
 		t.Fatalf("level = %v, want ERROR", got["level"])
 	}
-	if got["policy"] != "broken" || got["policy_version"] != float64(2) {
-		t.Fatalf("failure log should name the policy and version: %s", raw)
-	}
-	if !strings.Contains(raw, "attempt to index a nil value") {
+	if !strings.Contains(raw, "no eligible target") {
 		t.Fatalf("failure log should carry the error summary: %s", raw)
 	}
 	if _, ok := got["selected"]; ok {

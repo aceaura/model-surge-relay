@@ -9,6 +9,4 @@ func CollectionKey(name string) string { return prefix + "collection:" + name }
 
 func UserModelKey(name string) string { return prefix + "usermodel:" + name }
 
-func PolicyKey(name string) string { return prefix + "policy:" + name }
-
 func CatalogKey() string { return prefix + "catalog" }

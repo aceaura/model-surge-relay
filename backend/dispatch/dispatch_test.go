@@ -11,8 +11,8 @@ import (
 	"github.com/aceaura/model-surge-relay/backend/apperr"
 	"github.com/aceaura/model-surge-relay/backend/collection"
 	"github.com/aceaura/model-surge-relay/backend/contract/relayv1"
-	"github.com/aceaura/model-surge-relay/backend/policy"
 	"github.com/aceaura/model-surge-relay/backend/runstate"
+	"github.com/aceaura/model-surge-relay/backend/strategy"
 	"github.com/aceaura/model-surge-relay/backend/upstreamclient"
 	"github.com/aceaura/model-surge-relay/backend/usermodel"
 )
@@ -43,29 +43,6 @@ type fakeCollections struct {
 
 func (f fakeCollections) Snapshot(context.Context, string) (collection.Snapshot, error) {
 	return f.snap, f.err
-}
-
-type fakePolicies struct {
-	policy policy.Policy
-	err    error
-}
-
-func (f fakePolicies) Get(context.Context, string) (policy.Policy, error) {
-	return f.policy, f.err
-}
-
-type fakeEngine struct {
-	calls    int
-	decision policy.Decision
-	err      error
-	// seen 保留最后一次输入，供断言策略确实拿到了快照与运行态。
-	seen policy.Input
-}
-
-func (f *fakeEngine) Execute(_ context.Context, _ policy.Policy, in policy.Input) (policy.Decision, error) {
-	f.calls++
-	f.seen = in
-	return f.decision, f.err
 }
 
 type fakeRunStates struct {
@@ -125,19 +102,30 @@ type recordingLogger struct{ entries []LogEntry }
 
 func (l *recordingLogger) Dispatched(e LogEntry) { l.entries = append(l.entries, e) }
 
-// twoGroupSnapshot 是多数测试共用的两组四成员布局。
+// member 造一个已知且启用的成员，便于用最少噪声表达测试意图。
+func member(id string, pos int) collection.Member {
+	return collection.Member{ModelID: id, Position: pos, Enabled: true, Known: true}
+}
+
+func group(name, typ string, pos int, members ...collection.Member) collection.GroupSnapshot {
+	return collection.GroupSnapshot{Name: name, Type: typ, Position: pos, Members: members}
+}
+
+// snapshot 是多数测试共用的两组四成员布局。
 func twoGroupSnapshot() collection.Snapshot {
-	return snapshot(
-		group("primary", "fast", 0, member("kimi-1/k3", 0), member("kimi-2/k3", 1)),
-		group("backup", "cheap", 1, member("ark-1/ds", 0), member("ark-2/ds", 1)),
-	)
+	return collection.Snapshot{
+		Name:      "c1",
+		UpdatedAt: time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC),
+		Groups: []collection.GroupSnapshot{
+			group("primary", "fast", 0, member("kimi-1/k3", 0), member("kimi-2/k3", 1)),
+			group("backup", "cheap", 1, member("ark-1/ds", 0), member("ark-2/ds", 1)),
+		},
+	}
 }
 
 type harness struct {
 	svc       *Service
 	users     *fakeUserModels
-	policies  fakePolicies
-	engine    *fakeEngine
 	runStates *fakeRunStates
 	resolver  *fakeResolver
 	logger    *recordingLogger
@@ -147,8 +135,6 @@ func newHarness(t *testing.T, um usermodel.UserModel, snap collection.Snapshot) 
 	t.Helper()
 	h := &harness{
 		users:     &fakeUserModels{model: um},
-		policies:  fakePolicies{policy: policy.Policy{Name: um.Policy, Language: policy.LangLua, Version: 4}},
-		engine:    &fakeEngine{},
 		runStates: &fakeRunStates{states: map[string]runstate.State{}},
 		resolver:  &fakeResolver{fail: map[string]error{}},
 		logger:    &recordingLogger{},
@@ -156,8 +142,6 @@ func newHarness(t *testing.T, um usermodel.UserModel, snap collection.Snapshot) 
 	h.svc = &Service{
 		UserModels:  h.users,
 		Collections: fakeCollections{snap: snap},
-		Policies:    h.policies,
-		Engine:      h.engine,
 		RunStates:   h.runStates,
 		Resolver:    h.resolver,
 		Thresholds:  runstate.Thresholds{FailureThreshold: 3, CooldownDuration: time.Minute},
@@ -166,11 +150,7 @@ func newHarness(t *testing.T, um usermodel.UserModel, snap collection.Snapshot) 
 	return h
 }
 
-func boundUserModel() usermodel.UserModel {
-	return usermodel.UserModel{Name: "sonnet", Collection: "c1", Policy: "preset", Enabled: true}
-}
-
-func unboundUserModel() usermodel.UserModel {
+func testUserModel() usermodel.UserModel {
 	return usermodel.UserModel{Name: "sonnet", Collection: "c1", Enabled: true}
 }
 
@@ -195,104 +175,159 @@ func asAppErr(t *testing.T, err error) *apperr.Error {
 	return e
 }
 
-func TestDispatchExecutesPolicyExactlyOnce(t *testing.T) {
-	h := newHarness(t, boundUserModel(), twoGroupSnapshot())
-	h.engine.decision = policy.Decision{Candidates: []string{"kimi-2/k3", "kimi-1/k3"}}
-
+func TestDispatchFollowsGroupOrderByDefault(t *testing.T) {
+	h := newHarness(t, testUserModel(), twoGroupSnapshot())
 	resp, err := h.svc.Dispatch(context.Background(), request())
 	if err != nil {
 		t.Fatalf("dispatch: %v", err)
-	}
-	if h.engine.calls != 1 {
-		t.Fatalf("policy executed %d times, want exactly 1", h.engine.calls)
-	}
-	if resp.Target.ModelID != "kimi-2/k3" {
-		t.Fatalf("target = %q, want the policy's first candidate", resp.Target.ModelID)
-	}
-}
-
-func TestDispatchPolicyStillRunsOnceWhenAllCandidatesFail(t *testing.T) {
-	h := newHarness(t, boundUserModel(), twoGroupSnapshot())
-	h.engine.decision = policy.Decision{Candidates: []string{"kimi-1/k3", "kimi-2/k3"}}
-	h.resolver.fail["kimi-1/k3"] = apperr.New(apperr.TargetUnavailable, "boom 1")
-	h.resolver.fail["kimi-2/k3"] = apperr.New(apperr.TargetUnavailable, "boom 2")
-
-	if _, err := h.svc.Dispatch(context.Background(), request()); err == nil {
-		t.Fatal("expected failure")
-	}
-	if h.engine.calls != 1 {
-		t.Fatalf("policy executed %d times, want 1 (no retry, no fallback)", h.engine.calls)
-	}
-}
-
-func TestDispatchPassesSnapshotAndRuntimeToPolicy(t *testing.T) {
-	h := newHarness(t, boundUserModel(), twoGroupSnapshot())
-	h.runStates.states["ark-1/ds"] = runstate.State{
-		ModelID: "ark-1/ds", ConsecutiveFailures: 2,
-		Usage: runstate.Usage{InputTokens: 100, RequestCount: 3},
-	}
-	h.engine.decision = policy.Decision{Candidates: []string{"kimi-1/k3"}}
-
-	req := request()
-	req.EstTokens = 4096
-	req.TriedIDs = []string{"kimi-2/k3"}
-	if _, err := h.svc.Dispatch(context.Background(), req); err != nil {
-		t.Fatalf("dispatch: %v", err)
-	}
-
-	in := h.engine.seen
-	if in.Collection.Name != "c1" || len(in.Collection.Groups) != 2 {
-		t.Fatalf("collection input = %+v", in.Collection)
-	}
-	if in.Request.EstTokens != 4096 || in.Request.RequestID != "req-1" {
-		t.Fatalf("request input = %+v", in.Request)
-	}
-	if fmt.Sprint(in.Request.TriedIDs) != "[kimi-2/k3]" {
-		t.Fatalf("tried ids = %v", in.Request.TriedIDs)
-	}
-	st := in.Runtime["ark-1/ds"]
-	if st.ConsecutiveFailures != 2 || st.InputTokens != 100 || st.RequestCount != 3 {
-		t.Fatalf("runtime input = %+v", st)
-	}
-	if len(in.Runtime) != 4 {
-		t.Fatalf("runtime entries = %d, want one per member", len(in.Runtime))
-	}
-}
-
-func TestDispatchExposesCoolingUntilToPolicy(t *testing.T) {
-	h := newHarness(t, boundUserModel(), twoGroupSnapshot())
-	until := time.Now().Add(time.Hour)
-	h.runStates.states["kimi-1/k3"] = runstate.State{ModelID: "kimi-1/k3", Cooling: true, CoolingUntil: until}
-	h.engine.decision = policy.Decision{Candidates: []string{"kimi-2/k3"}}
-	if _, err := h.svc.Dispatch(context.Background(), request()); err != nil {
-		t.Fatalf("dispatch: %v", err)
-	}
-	st := h.engine.seen.Runtime["kimi-1/k3"]
-	if !st.Cooling || st.CoolingUntil != until.Unix() {
-		t.Fatalf("cooling state = %+v, want cooling until %d", st, until.Unix())
-	}
-}
-
-func TestDispatchFallsBackToGroupOrderWithoutPolicy(t *testing.T) {
-	h := newHarness(t, unboundUserModel(), twoGroupSnapshot())
-	resp, err := h.svc.Dispatch(context.Background(), request())
-	if err != nil {
-		t.Fatalf("dispatch: %v", err)
-	}
-	if h.engine.calls != 0 {
-		t.Fatalf("engine called %d times for an unbound user model", h.engine.calls)
 	}
 	if resp.Target.ModelID != "kimi-1/k3" {
 		t.Fatalf("target = %q, want first member of first group", resp.Target.ModelID)
 	}
-	if resp.Decision.Policy != "" || resp.Decision.PolicyVersion != 0 {
-		t.Fatalf("decision = %+v, want no policy provenance", resp.Decision)
+	if got := resp.Decision.Candidates; fmt.Sprint(got) !=
+		fmt.Sprint([]relayv1.PhasedCandidate{
+			{ModelID: "kimi-1/k3", Phase: strategy.PhaseStandard},
+			{ModelID: "kimi-2/k3", Phase: strategy.PhaseStandard},
+			{ModelID: "ark-1/ds", Phase: strategy.PhaseStandard},
+			{ModelID: "ark-2/ds", Phase: strategy.PhaseStandard},
+		}) {
+		t.Fatalf("candidates = %v, want group-then-member order, all standard phase", got)
+	}
+}
+
+func TestDispatchHonorsPriorityChain(t *testing.T) {
+	snap := twoGroupSnapshot()
+	snap.Strategy = strategy.Strategy{PriorityChain: []string{"backup", "primary"}}
+	h := newHarness(t, testUserModel(), snap)
+
+	resp, err := h.svc.Dispatch(context.Background(), request())
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	if resp.Target.ModelID != "ark-1/ds" {
+		t.Fatalf("target = %q, want the chain's first group", resp.Target.ModelID)
+	}
+	if resp.Decision.Group != "backup" || resp.Decision.GroupType != "cheap" {
+		t.Fatalf("decision provenance = %+v", resp.Decision)
+	}
+}
+
+func TestDispatchReportsGroupExhaustion(t *testing.T) {
+	snap := twoGroupSnapshot()
+	snap.Strategy = strategy.Strategy{PriorityChain: []string{"primary", "backup"}}
+	h := newHarness(t, testUserModel(), snap)
+	// 主组两人一个冷却一个已试，整组不可用 → 跳下一组并留 group_skip。
+	h.runStates.states["kimi-1/k3"] = runstate.State{ModelID: "kimi-1/k3", Cooling: true}
+	req := request()
+	req.TriedIDs = []string{"kimi-2/k3"}
+
+	resp, err := h.svc.Dispatch(context.Background(), req)
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	if resp.Target.ModelID != "ark-1/ds" {
+		t.Fatalf("target = %q, want failover into the next group", resp.Target.ModelID)
+	}
+	if len(resp.Decision.GroupSkips) != 1 ||
+		resp.Decision.GroupSkips[0].Group != "primary" ||
+		resp.Decision.GroupSkips[0].Reason != strategy.GroupExhausted {
+		t.Fatalf("group skips = %+v, want primary group_exhausted", resp.Decision.GroupSkips)
+	}
+}
+
+func TestDispatchOverflowRoutesCompactThenResume(t *testing.T) {
+	snap := collection.Snapshot{
+		Name: "c1",
+		Strategy: strategy.Strategy{
+			PriorityChain: []string{"primary"},
+			Overflow: strategy.Overflow{
+				Enabled:         true,
+				ThresholdTokens: 1000,
+				CompactGroups:   []string{"compact"},
+			},
+		},
+		Groups: []collection.GroupSnapshot{
+			group("primary", "kimi", 0, member("kimi-1/k3", 0)),
+			group("compact", "compact", 1, member("ds-1/flash", 0)),
+		},
+	}
+	h := newHarness(t, testUserModel(), snap)
+	req := request()
+	req.EstTokens = 5000
+
+	resp, err := h.svc.Dispatch(context.Background(), req)
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	if resp.Target.ModelID != "ds-1/flash" {
+		t.Fatalf("target = %q, want the compact pool under overflow", resp.Target.ModelID)
+	}
+	want := []relayv1.PhasedCandidate{
+		{ModelID: "ds-1/flash", Phase: strategy.PhaseCompact},
+		{ModelID: "kimi-1/k3", Phase: strategy.PhaseResume},
+	}
+	if fmt.Sprint(resp.Decision.Candidates) != fmt.Sprint(want) {
+		t.Fatalf("candidates = %v, want compact-then-resume %v", resp.Decision.Candidates, want)
+	}
+}
+
+func TestDispatchBelowThresholdStaysStandard(t *testing.T) {
+	snap := collection.Snapshot{
+		Name: "c1",
+		Strategy: strategy.Strategy{
+			Overflow: strategy.Overflow{
+				Enabled:         true,
+				ThresholdTokens: 1000,
+				CompactGroups:   []string{"compact"},
+			},
+		},
+		Groups: []collection.GroupSnapshot{
+			group("primary", "kimi", 0, member("kimi-1/k3", 0)),
+			group("compact", "compact", 1, member("ds-1/flash", 0)),
+		},
+	}
+	h := newHarness(t, testUserModel(), snap)
+	req := request()
+	req.EstTokens = 500
+
+	resp, err := h.svc.Dispatch(context.Background(), req)
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	if resp.Target.ModelID != "kimi-1/k3" {
+		t.Fatalf("target = %q, want the primary pool below threshold", resp.Target.ModelID)
+	}
+	for _, c := range resp.Decision.Candidates {
+		if c.Phase != strategy.PhaseStandard {
+			t.Fatalf("phase = %q below threshold, want all standard", c.Phase)
+		}
+	}
+}
+
+func TestDispatchCoolingMemberSkippedWithReason(t *testing.T) {
+	h := newHarness(t, testUserModel(), twoGroupSnapshot())
+	h.runStates.states["kimi-1/k3"] = runstate.State{ModelID: "kimi-1/k3", Cooling: true}
+
+	resp, err := h.svc.Dispatch(context.Background(), request())
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	if resp.Target.ModelID != "kimi-2/k3" {
+		t.Fatalf("target = %q, want the non-cooling member", resp.Target.ModelID)
+	}
+	var found bool
+	for _, s := range resp.Decision.Skipped {
+		if s.ModelID == "kimi-1/k3" && s.Reason == relayv1.SkipCooling {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("skipped = %+v, want a cooling entry for kimi-1/k3", resp.Decision.Skipped)
 	}
 }
 
 func TestDispatchEmptyCandidateListSkipsResolve(t *testing.T) {
-	h := newHarness(t, boundUserModel(), twoGroupSnapshot())
-	h.engine.decision = policy.Decision{Candidates: []string{}}
+	h := newHarness(t, testUserModel(), collection.Snapshot{Name: "c1"})
 
 	_, err := h.svc.Dispatch(context.Background(), request())
 	e := asAppErr(t, err)
@@ -304,20 +339,8 @@ func TestDispatchEmptyCandidateListSkipsResolve(t *testing.T) {
 	}
 }
 
-func TestDispatchAllFilteredOutSkipsResolve(t *testing.T) {
-	h := newHarness(t, boundUserModel(), twoGroupSnapshot())
-	h.engine.decision = policy.Decision{Candidates: []string{"outside/1", "outside/2"}}
-	if _, err := h.svc.Dispatch(context.Background(), request()); err == nil {
-		t.Fatal("expected target_unavailable")
-	}
-	if len(h.resolver.calls) != 0 {
-		t.Fatalf("resolve called %v", h.resolver.calls)
-	}
-}
-
 func TestDispatchFallsForwardToNextCandidateOnResolveFailure(t *testing.T) {
-	h := newHarness(t, boundUserModel(), twoGroupSnapshot())
-	h.engine.decision = policy.Decision{Candidates: []string{"kimi-1/k3", "kimi-2/k3"}}
+	h := newHarness(t, testUserModel(), twoGroupSnapshot())
 	h.resolver.fail["kimi-1/k3"] = apperr.New(apperr.TargetUnavailable, "upstream 503")
 
 	resp, err := h.svc.Dispatch(context.Background(), request())
@@ -345,10 +368,13 @@ func TestDispatchFallsForwardToNextCandidateOnResolveFailure(t *testing.T) {
 }
 
 func TestDispatchAllResolveFailuresCarrySummary(t *testing.T) {
-	h := newHarness(t, boundUserModel(), twoGroupSnapshot())
-	h.engine.decision = policy.Decision{Candidates: []string{"kimi-1/k3", "ark-1/ds"}}
+	snap := twoGroupSnapshot()
+	snap.Strategy = strategy.Strategy{PriorityChain: []string{"primary", "backup"}}
+	h := newHarness(t, testUserModel(), snap)
 	h.resolver.fail["kimi-1/k3"] = apperr.New(apperr.TargetUnavailable, "first down")
+	h.resolver.fail["kimi-2/k3"] = apperr.New(apperr.TargetUnavailable, "k2 down")
 	h.resolver.fail["ark-1/ds"] = apperr.New(apperr.TargetUnavailable, "second down")
+	h.resolver.fail["ark-2/ds"] = apperr.New(apperr.TargetUnavailable, "a2 down")
 
 	_, err := h.svc.Dispatch(context.Background(), request())
 	e := asAppErr(t, err)
@@ -363,8 +389,9 @@ func TestDispatchAllResolveFailuresCarrySummary(t *testing.T) {
 }
 
 func TestDispatchCarriesFullTargetAndProvenance(t *testing.T) {
-	h := newHarness(t, boundUserModel(), twoGroupSnapshot())
-	h.engine.decision = policy.Decision{Candidates: []string{"ark-1/ds"}, Note: "cheapest first"}
+	snap := twoGroupSnapshot()
+	snap.Strategy = strategy.Strategy{PriorityChain: []string{"backup", "primary"}}
+	h := newHarness(t, testUserModel(), snap)
 
 	resp, err := h.svc.Dispatch(context.Background(), request())
 	if err != nil {
@@ -379,9 +406,12 @@ func TestDispatchCarriesFullTargetAndProvenance(t *testing.T) {
 		t.Fatalf("headers = %v, credentials must pass through verbatim", tgt.Headers)
 	}
 	d := resp.Decision
-	if d.Policy != "preset" || d.PolicyVersion != 4 || d.Collection != "c1" ||
-		d.Group != "backup" || d.GroupType != "cheap" || d.Note != "cheapest first" {
+	if d.Collection != "c1" || d.Group != "backup" || d.GroupType != "cheap" {
 		t.Fatalf("decision = %+v", d)
+	}
+	if !d.CollectionUpdatedAt.Equal(snap.UpdatedAt) {
+		t.Fatalf("collection_updated_at = %v, want the snapshot's version stamp %v",
+			d.CollectionUpdatedAt, snap.UpdatedAt)
 	}
 	if resp.RequestID != "req-1" {
 		t.Fatalf("request id = %q", resp.RequestID)
@@ -389,8 +419,7 @@ func TestDispatchCarriesFullTargetAndProvenance(t *testing.T) {
 }
 
 func TestDispatchStringRedactsCredentials(t *testing.T) {
-	h := newHarness(t, boundUserModel(), twoGroupSnapshot())
-	h.engine.decision = policy.Decision{Candidates: []string{"kimi-1/k3"}}
+	h := newHarness(t, testUserModel(), twoGroupSnapshot())
 	resp, err := h.svc.Dispatch(context.Background(), request())
 	if err != nil {
 		t.Fatalf("dispatch: %v", err)
@@ -401,20 +430,19 @@ func TestDispatchStringRedactsCredentials(t *testing.T) {
 }
 
 func TestDispatchPropagatesAuthFailure(t *testing.T) {
-	h := newHarness(t, boundUserModel(), twoGroupSnapshot())
+	h := newHarness(t, testUserModel(), twoGroupSnapshot())
 	h.users.err = apperr.New(apperr.Unauthorized, "client key mismatch")
 	_, err := h.svc.Dispatch(context.Background(), request())
 	if e := asAppErr(t, err); e.Code != apperr.Unauthorized {
 		t.Fatalf("code = %s, want unauthorized", e.Code)
 	}
-	if h.engine.calls != 0 || len(h.resolver.calls) != 0 {
-		t.Fatal("an unauthenticated request must not reach the policy or upstream")
+	if len(h.resolver.calls) != 0 {
+		t.Fatal("an unauthenticated request must not reach upstream")
 	}
 }
 
 func TestDispatchPassesProtocolAndKeyToAuth(t *testing.T) {
-	h := newHarness(t, boundUserModel(), twoGroupSnapshot())
-	h.engine.decision = policy.Decision{Candidates: []string{"kimi-1/k3"}}
+	h := newHarness(t, testUserModel(), twoGroupSnapshot())
 	if _, err := h.svc.Dispatch(context.Background(), request()); err != nil {
 		t.Fatalf("dispatch: %v", err)
 	}
@@ -424,7 +452,7 @@ func TestDispatchPassesProtocolAndKeyToAuth(t *testing.T) {
 }
 
 func TestDispatchRequiresModel(t *testing.T) {
-	h := newHarness(t, boundUserModel(), twoGroupSnapshot())
+	h := newHarness(t, testUserModel(), twoGroupSnapshot())
 	req := request()
 	req.Model = "  "
 	_, err := h.svc.Dispatch(context.Background(), req)
@@ -434,32 +462,8 @@ func TestDispatchRequiresModel(t *testing.T) {
 	}
 }
 
-func TestDispatchPropagatesPolicyTimeoutAsRetryable(t *testing.T) {
-	h := newHarness(t, boundUserModel(), twoGroupSnapshot())
-	h.engine.err = apperr.New(apperr.PolicyTimeout, "policy timed out")
-	_, err := h.svc.Dispatch(context.Background(), request())
-	e := asAppErr(t, err)
-	if e.Code != apperr.PolicyTimeout || !e.Retryable {
-		t.Fatalf("error = %+v, want retryable policy_timeout", e)
-	}
-	if len(h.resolver.calls) != 0 {
-		t.Fatal("a timed-out policy must not lead to resolution")
-	}
-}
-
-func TestDispatchPropagatesPolicyErrorAsNonRetryable(t *testing.T) {
-	h := newHarness(t, boundUserModel(), twoGroupSnapshot())
-	h.engine.err = apperr.New(apperr.PolicyError, "attempt to index a nil value")
-	_, err := h.svc.Dispatch(context.Background(), request())
-	e := asAppErr(t, err)
-	if e.Code != apperr.PolicyError || e.Retryable {
-		t.Fatalf("error = %+v, want non-retryable policy_error", e)
-	}
-}
-
 func TestDispatchTriedIDsExcludeCandidate(t *testing.T) {
-	h := newHarness(t, boundUserModel(), twoGroupSnapshot())
-	h.engine.decision = policy.Decision{Candidates: []string{"kimi-1/k3", "kimi-2/k3"}}
+	h := newHarness(t, testUserModel(), twoGroupSnapshot())
 	req := request()
 	req.TriedIDs = []string{"kimi-1/k3"}
 
@@ -476,9 +480,9 @@ func TestDispatchTriedIDsExcludeCandidate(t *testing.T) {
 }
 
 func TestDispatchLogsProvenanceWithoutCredentials(t *testing.T) {
-	h := newHarness(t, boundUserModel(), twoGroupSnapshot())
+	h := newHarness(t, testUserModel(), twoGroupSnapshot())
 	h.resolver.latency = 5 * time.Millisecond
-	h.engine.decision = policy.Decision{Candidates: []string{"outside/1", "kimi-1/k3"}}
+	h.runStates.states["kimi-1/k3"] = runstate.State{ModelID: "kimi-1/k3", Cooling: true}
 	if _, err := h.svc.Dispatch(context.Background(), request()); err != nil {
 		t.Fatalf("dispatch: %v", err)
 	}
@@ -486,10 +490,11 @@ func TestDispatchLogsProvenanceWithoutCredentials(t *testing.T) {
 		t.Fatalf("log entries = %d, want 1", len(h.logger.entries))
 	}
 	e := h.logger.entries[0]
-	if e.RequestID != "req-1" || e.UserModel != "sonnet" || e.Policy != "preset" || e.PolicyVersion != 4 {
+	if e.RequestID != "req-1" || e.UserModel != "sonnet" {
 		t.Fatalf("entry = %+v", e)
 	}
-	if e.Selected != "kimi-1/k3" || e.Candidates != 1 || len(e.Skipped) != 1 {
+	if e.Selected != "kimi-2/k3" || e.SelectedPhase != strategy.PhaseStandard ||
+		e.Candidates != 3 || len(e.Skipped) != 1 {
 		t.Fatalf("entry = %+v", e)
 	}
 	if e.Duration <= 0 {
@@ -501,8 +506,8 @@ func TestDispatchLogsProvenanceWithoutCredentials(t *testing.T) {
 }
 
 func TestDispatchLogsFailureReason(t *testing.T) {
-	h := newHarness(t, boundUserModel(), twoGroupSnapshot())
-	h.engine.err = apperr.New(apperr.PolicyError, "boom")
+	h := newHarness(t, testUserModel(), twoGroupSnapshot())
+	h.users.err = apperr.New(apperr.Internal, "boom")
 	if _, err := h.svc.Dispatch(context.Background(), request()); err == nil {
 		t.Fatal("expected failure")
 	}
@@ -511,8 +516,35 @@ func TestDispatchLogsFailureReason(t *testing.T) {
 	}
 }
 
+// TestDryRunMatchesDispatchSequence 试运行与真实调度共用 compose 核，
+// 这条把「看到的序列就是上线后的序列」钉成断言。
+func TestDryRunMatchesDispatchSequence(t *testing.T) {
+	snap := twoGroupSnapshot()
+	snap.Strategy = strategy.Strategy{PriorityChain: []string{"backup", "primary"}}
+	h := newHarness(t, testUserModel(), snap)
+
+	decision, err := h.svc.DryRun(context.Background(), "c1", 0, []string{"ark-1/ds"})
+	if err != nil {
+		t.Fatalf("dry run: %v", err)
+	}
+	if len(h.resolver.calls) != 0 {
+		t.Fatalf("dry run resolved %v, want zero upstream traffic", h.resolver.calls)
+	}
+	if decision.Collection != "c1" || !decision.CollectionUpdatedAt.Equal(snap.UpdatedAt) {
+		t.Fatalf("decision = %+v", decision)
+	}
+	want := []relayv1.PhasedCandidate{
+		{ModelID: "ark-2/ds", Phase: strategy.PhaseStandard},
+		{ModelID: "kimi-1/k3", Phase: strategy.PhaseStandard},
+		{ModelID: "kimi-2/k3", Phase: strategy.PhaseStandard},
+	}
+	if fmt.Sprint(decision.Candidates) != fmt.Sprint(want) {
+		t.Fatalf("candidates = %v, want %v", decision.Candidates, want)
+	}
+}
+
 func TestReportForwardsToRunState(t *testing.T) {
-	h := newHarness(t, boundUserModel(), twoGroupSnapshot())
+	h := newHarness(t, testUserModel(), twoGroupSnapshot())
 	h.runStates.applied = true
 	resp, err := h.svc.Report(context.Background(), relayv1.ResultReport{
 		ReportID: "rep-1", RequestID: "req-1", ModelID: "kimi-1/k3",
@@ -543,7 +575,7 @@ func TestReportForwardsToRunState(t *testing.T) {
 // 不钉住的话下一个人看到契约有五位而运行态只累三位，会当成漏了并顺手加上，
 // 于是配额计算悄悄开始用错的权重。要改这个决定得先改这条测试，那时会读到理由。
 func TestReportDoesNotAccumulateUnpricedUsage(t *testing.T) {
-	h := newHarness(t, boundUserModel(), twoGroupSnapshot())
+	h := newHarness(t, testUserModel(), twoGroupSnapshot())
 	h.runStates.applied = true
 	if _, err := h.svc.Report(context.Background(), relayv1.ResultReport{
 		ReportID: "rep-unpriced", RequestID: "req-unpriced", ModelID: "kimi-1/k3",
@@ -569,7 +601,7 @@ func TestReportDoesNotAccumulateUnpricedUsage(t *testing.T) {
 // 出现。这一层是纯字段搬运，断掉之后 runstate 与 codec 两侧的测试仍然全绿，
 // 而整条链路已经失效——所以它必须有自己的断言。
 func TestReportForwardsRetryAfter(t *testing.T) {
-	h := newHarness(t, boundUserModel(), twoGroupSnapshot())
+	h := newHarness(t, testUserModel(), twoGroupSnapshot())
 	h.runStates.applied = true
 	at := time.Now().Add(30 * time.Minute).UTC()
 
@@ -587,7 +619,7 @@ func TestReportForwardsRetryAfter(t *testing.T) {
 
 // TestReportForwardsZeroRetryAfter 上游没说时不能凭空造出一个时刻。
 func TestReportForwardsZeroRetryAfter(t *testing.T) {
-	h := newHarness(t, boundUserModel(), twoGroupSnapshot())
+	h := newHarness(t, testUserModel(), twoGroupSnapshot())
 	h.runStates.applied = true
 
 	if _, err := h.svc.Report(context.Background(), relayv1.ResultReport{
@@ -603,7 +635,7 @@ func TestReportForwardsZeroRetryAfter(t *testing.T) {
 }
 
 func TestReportDuplicateReturnsNotApplied(t *testing.T) {
-	h := newHarness(t, boundUserModel(), twoGroupSnapshot())
+	h := newHarness(t, testUserModel(), twoGroupSnapshot())
 	h.runStates.applied = false
 	resp, err := h.svc.Report(context.Background(), relayv1.ResultReport{
 		ReportID: "rep-1", ModelID: "kimi-1/k3", Outcome: string(runstate.OutcomeAbnormal),
@@ -617,7 +649,7 @@ func TestReportDuplicateReturnsNotApplied(t *testing.T) {
 }
 
 func TestReportPropagatesValidationError(t *testing.T) {
-	h := newHarness(t, boundUserModel(), twoGroupSnapshot())
+	h := newHarness(t, testUserModel(), twoGroupSnapshot())
 	h.runStates.applyErr = apperr.Field(apperr.InvalidRequest, "outcome", "unknown outcome")
 	_, err := h.svc.Report(context.Background(), relayv1.ResultReport{ReportID: "r", ModelID: "m", Outcome: "?"})
 	if e := asAppErr(t, err); e.Code != apperr.InvalidRequest {
@@ -626,7 +658,7 @@ func TestReportPropagatesValidationError(t *testing.T) {
 }
 
 func TestModelsSummarizesUserModels(t *testing.T) {
-	h := newHarness(t, boundUserModel(), twoGroupSnapshot())
+	h := newHarness(t, testUserModel(), twoGroupSnapshot())
 	resp, err := h.svc.Models(context.Background())
 	if err != nil {
 		t.Fatalf("models: %v", err)
@@ -635,7 +667,7 @@ func TestModelsSummarizesUserModels(t *testing.T) {
 		t.Fatalf("models = %+v", resp.Models)
 	}
 	m := resp.Models[0]
-	if m.Name != "sonnet" || m.Collection != "c1" || m.Policy != "preset" || !m.Enabled {
+	if m.Name != "sonnet" || m.Collection != "c1" || !m.Enabled {
 		t.Fatalf("summary = %+v", m)
 	}
 }
@@ -646,7 +678,7 @@ func TestModelsSummarizesUserModels(t *testing.T) {
 // 有人日后在这里加校验时漏掉新成员——那会让数据面的连接故障上报整条被拒，
 // 连流水都留不下。
 func TestReportAcceptsTransportOutcome(t *testing.T) {
-	h := newHarness(t, boundUserModel(), twoGroupSnapshot())
+	h := newHarness(t, testUserModel(), twoGroupSnapshot())
 	h.runStates.applied = true
 
 	if _, err := h.svc.Report(context.Background(), relayv1.ResultReport{

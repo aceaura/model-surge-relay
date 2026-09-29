@@ -28,15 +28,11 @@ func testPool(t *testing.T) *pgxpool.Pool {
 	}
 	t.Cleanup(s.Close)
 	if _, err := s.Pool().Exec(ctx,
-		`TRUNCATE user_models, policies, group_members, groups, collections RESTART IDENTITY CASCADE`); err != nil {
+		`TRUNCATE user_models, group_members, groups, collections RESTART IDENTITY CASCADE`); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 	if _, err := s.Pool().Exec(ctx, `INSERT INTO collections (name) VALUES ('c1'), ('c2')`); err != nil {
 		t.Fatalf("seed collections: %v", err)
-	}
-	if _, err := s.Pool().Exec(ctx,
-		`INSERT INTO policies (name, language, source) VALUES ('p1', 'lua', 'return {}')`); err != nil {
-		t.Fatalf("seed policy: %v", err)
 	}
 	return s.Pool()
 }
@@ -57,22 +53,14 @@ func seed(t *testing.T, r *Repo, m UserModel) UserModel {
 func TestCreateReturnsCompleteRecord(t *testing.T) {
 	r := newRepo(t)
 	got := seed(t, r, UserModel{
-		Name: "sonnet", Collection: "c1", Policy: "p1",
+		Name: "sonnet", Collection: "c1",
 		ClientKey: "sk-1", Protocol: "anthropic", Enabled: true,
 	})
-	if got.Collection != "c1" || got.Policy != "p1" || got.Protocol != "anthropic" || !got.Enabled {
+	if got.Collection != "c1" || got.Protocol != "anthropic" || !got.Enabled {
 		t.Fatalf("record = %+v", got)
 	}
 	if got.CreatedAt.IsZero() {
 		t.Fatal("created_at missing")
-	}
-}
-
-func TestCreateAllowsUnboundPolicy(t *testing.T) {
-	r := newRepo(t)
-	got := seed(t, r, UserModel{Name: "plain", Collection: "c1", ClientKey: "sk", Enabled: true})
-	if got.Policy != "" {
-		t.Fatalf("policy = %q, want empty", got.Policy)
 	}
 }
 
@@ -83,16 +71,6 @@ func TestCreateRejectsUnknownCollection(t *testing.T) {
 	e := asAppErr(t, err)
 	if e.Code != apperr.InvalidRequest || e.Field != "collection" {
 		t.Fatalf("error = %+v, want invalid_request on collection", e)
-	}
-}
-
-func TestCreateRejectsUnknownPolicy(t *testing.T) {
-	r := newRepo(t)
-	_, err := r.Create(context.Background(),
-		UserModel{Name: "x", Collection: "c1", Policy: "ghost", ClientKey: "sk", Enabled: true})
-	e := asAppErr(t, err)
-	if e.Code != apperr.InvalidRequest || e.Field != "policy" {
-		t.Fatalf("error = %+v, want invalid_request on policy", e)
 	}
 }
 
@@ -130,13 +108,13 @@ func TestCreateRejectsDuplicateName(t *testing.T) {
 
 func TestUpdateReplacesBinding(t *testing.T) {
 	r := newRepo(t)
-	seed(t, r, UserModel{Name: "m", Collection: "c1", Policy: "p1", ClientKey: "sk", Enabled: true})
+	seed(t, r, UserModel{Name: "m", Collection: "c1", ClientKey: "sk", Enabled: true})
 	got, err := r.Update(context.Background(),
 		UserModel{Name: "m", Collection: "c2", ClientKey: "sk2", Enabled: false})
 	if err != nil {
 		t.Fatalf("update: %v", err)
 	}
-	if got.Collection != "c2" || got.Policy != "" || got.Enabled {
+	if got.Collection != "c2" || got.Enabled {
 		t.Fatalf("record = %+v", got)
 	}
 }
@@ -175,7 +153,7 @@ func TestListAndDelete(t *testing.T) {
 
 func TestAuthenticateSucceedsAndStripsClientKey(t *testing.T) {
 	r := newRepo(t)
-	seed(t, r, UserModel{Name: "m", Collection: "c1", Policy: "p1",
+	seed(t, r, UserModel{Name: "m", Collection: "c1",
 		ClientKey: "sk-live", Protocol: "anthropic", Enabled: true})
 	got, err := r.Authenticate(context.Background(), "m", "anthropic", "sk-live")
 	if err != nil {
@@ -184,7 +162,7 @@ func TestAuthenticateSucceedsAndStripsClientKey(t *testing.T) {
 	if got.ClientKey != "" {
 		t.Fatal("authenticate must not hand the client key back to the caller")
 	}
-	if got.Policy != "p1" || got.Collection != "c1" {
+	if got.Collection != "c1" {
 		t.Fatalf("record = %+v", got)
 	}
 }

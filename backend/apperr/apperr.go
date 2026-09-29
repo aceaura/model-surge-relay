@@ -13,8 +13,6 @@ const (
 	Conflict          Code = "conflict"
 	Disabled          Code = "disabled"
 	TargetUnavailable Code = "target_unavailable"
-	PolicyError       Code = "policy_error"
-	PolicyTimeout     Code = "policy_timeout"
 	Internal          Code = "internal_error"
 )
 
@@ -39,10 +37,9 @@ func Field(code Code, field, message string) *Error {
 }
 
 // retryable 只有"换个目标或稍后重试可能成功"的失败为真。
-// PolicyError 是脚本 bug，重试必然再失败，故为假。
 func retryable(code Code) bool {
 	switch code {
-	case TargetUnavailable, PolicyTimeout, Internal:
+	case TargetUnavailable, Internal:
 		return true
 	default:
 		return false
@@ -61,7 +58,7 @@ func Status(code Code) int {
 		return http.StatusConflict
 	case Disabled:
 		return http.StatusForbidden
-	case TargetUnavailable, PolicyTimeout:
+	case TargetUnavailable:
 		return http.StatusServiceUnavailable
 	default:
 		return http.StatusInternalServerError

@@ -46,6 +46,8 @@ CREATE TABLE IF NOT EXISTS policies (
 CREATE TABLE IF NOT EXISTS user_models (
     name       TEXT PRIMARY KEY,
     collection TEXT        NOT NULL REFERENCES collections(name),
+    -- policy 是遗产列：代码路径已不再读写，物理保留供一次性迁移
+    -- （/admin/migrate-policies）反查脚本引用；迁移确认后随 policies 表人工 DROP。
     policy     TEXT        REFERENCES policies(name),
     client_key TEXT        NOT NULL,
     protocol   TEXT        NOT NULL DEFAULT '',

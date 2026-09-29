@@ -1,14 +1,13 @@
-// Package usermodel 持有对外暴露的 user model：绑定 Collection 与可选策略，
-// 并承担调度面的客户端鉴权。
+// Package usermodel 持有对外暴露的 user model：绑定 Collection，
+// 并承担调度面的客户端鉴权。策略组合挂在 Collection 上，本层不再绑策略。
 package usermodel
 
 import "time"
 
-// UserModel 是一个对外模型名。Policy 为空表示未绑定策略，调度走兜底顺序。
+// UserModel 是一个对外模型名。
 type UserModel struct {
 	Name       string    `json:"name"`
 	Collection string    `json:"collection"`
-	Policy     string    `json:"policy,omitempty"`
 	Protocol   string    `json:"protocol,omitempty"`
 	Enabled    bool      `json:"enabled"`
 	Note       string    `json:"note,omitempty"`

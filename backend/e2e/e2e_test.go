@@ -20,9 +20,7 @@ import (
 	"github.com/aceaura/model-surge-relay/backend/contract/relayv1"
 	"github.com/aceaura/model-surge-relay/backend/dispatch"
 	"github.com/aceaura/model-surge-relay/backend/httpapi"
-	"github.com/aceaura/model-surge-relay/backend/policy"
-	"github.com/aceaura/model-surge-relay/backend/policy/examples"
-	"github.com/aceaura/model-surge-relay/backend/policy/runtime"
+	"github.com/aceaura/model-surge-relay/backend/migrate"
 	"github.com/aceaura/model-surge-relay/backend/runstate"
 	"github.com/aceaura/model-surge-relay/backend/store"
 	"github.com/aceaura/model-surge-relay/backend/upstreamclient"
@@ -114,7 +112,7 @@ type env struct {
 	relay    *httptest.Server
 	upstream *stubUpstream
 	runState *runstate.Repo
-	cache    *cache.Cache
+	pool     *store.Store
 }
 
 func newEnv(t *testing.T) *env {
@@ -153,12 +151,7 @@ func newEnv(t *testing.T) *env {
 
 	up := newStubUpstream(t, catalog())
 	upstream := upstreamclient.New(up.server.URL, "delivery-key")
-	engine := policy.NewEngine(
-		policy.NewRegistry(runtime.NewLua(), runtime.NewJavaScript(), runtime.NewTypeScript()),
-		time.Second,
-	)
 	collections := collection.NewRepo(st.Pool(), c, upstream)
-	policies := policy.NewRepo(st.Pool(), c, engine)
 	userModels := usermodel.NewRepo(st.Pool(), c)
 	runStates := runstate.NewRepo(st.Pool())
 
@@ -166,16 +159,13 @@ func newEnv(t *testing.T) *env {
 		Dispatch: &dispatch.Service{
 			UserModels:  userModels,
 			Collections: collections,
-			Policies:    policies,
-			Engine:      engine,
 			RunStates:   runStates,
 			Resolver:    upstream,
 			Thresholds:  runstate.Thresholds{FailureThreshold: 2, CooldownDuration: time.Hour},
 		},
 		Health:      stubHealth{st: st, c: c, up: upstream},
 		Collections: collections,
-		Policies:    policies,
-		Engine:      engine,
+		Migrator:    migrate.New(st.Pool(), collections),
 		UserModels:  userModels,
 		RunStates:   runStates,
 		DispatchKey: dispatchKey,
@@ -184,13 +174,11 @@ func newEnv(t *testing.T) *env {
 	relay := httptest.NewServer(api.Handler())
 	t.Cleanup(relay.Close)
 
-	// 缓存后端跨用例共享，清掉可能残留的 usermodel / policy 键。
+	// 缓存后端跨用例共享，清掉可能残留的 usermodel 键。
 	if backend != nil {
-		for _, key := range []string{cache.UserModelKey("sonnet"), cache.PolicyKey("dynamic")} {
-			_ = backend.Del(ctx, key)
-		}
+		_ = backend.Del(ctx, cache.UserModelKey("sonnet"))
 	}
-	return &env{relay: relay, upstream: up, runState: runStates, cache: c}
+	return &env{relay: relay, upstream: up, runState: runStates, pool: st}
 }
 
 type stubHealth struct {
@@ -243,8 +231,8 @@ func (e *env) mustAdmin(t *testing.T, method, path, body string, want int) strin
 	return out
 }
 
-// setup 建好 Collection、两组成员与 user model；policySource 为空表示不绑定策略。
-func (e *env) setup(t *testing.T, policySource string) {
+// setup 建好 Collection、两组成员与 user model。
+func (e *env) setup(t *testing.T) {
 	t.Helper()
 	e.mustAdmin(t, http.MethodPost, "/admin/collections", `{"name":"c1"}`, http.StatusCreated)
 	e.mustAdmin(t, http.MethodPost, "/admin/collections/c1/groups",
@@ -255,19 +243,9 @@ func (e *env) setup(t *testing.T, policySource string) {
 		`{"members":["kimi-1/k3","kimi-2/k3"]}`, http.StatusNoContent)
 	e.mustAdmin(t, http.MethodPut, "/admin/collections/c1/groups/backup/members",
 		`{"members":["ark-1/ds"]}`, http.StatusNoContent)
-
-	body := `{"name":"sonnet","collection":"c1","client_key":"sk-client","protocol":"anthropic","enabled":true}`
-	if policySource != "" {
-		payload, err := json.Marshal(map[string]string{
-			"name": "dynamic", "language": "lua", "source": policySource,
-		})
-		if err != nil {
-			t.Fatalf("marshal policy: %v", err)
-		}
-		e.mustAdmin(t, http.MethodPost, "/admin/policies", string(payload), http.StatusCreated)
-		body = `{"name":"sonnet","collection":"c1","policy":"dynamic","client_key":"sk-client","protocol":"anthropic","enabled":true}`
-	}
-	e.mustAdmin(t, http.MethodPost, "/admin/user-models", body, http.StatusCreated)
+	e.mustAdmin(t, http.MethodPost, "/admin/user-models",
+		`{"name":"sonnet","collection":"c1","client_key":"sk-client","protocol":"anthropic","enabled":true}`,
+		http.StatusCreated)
 }
 
 func (e *env) dispatch(t *testing.T, requestID string, tried []string) (int, relayv1.DispatchResponse, string) {
@@ -292,18 +270,9 @@ func (e *env) dispatch(t *testing.T, requestID string, tried []string) (int, rel
 	return status, out, body
 }
 
-func presetSource(t *testing.T) string {
-	t.Helper()
-	src, err := examples.Source(examples.Preset)
-	if err != nil {
-		t.Fatalf("example source: %v", err)
-	}
-	return src
-}
-
 func TestEndToEndDispatchCarriesFullTargetAndProvenance(t *testing.T) {
 	e := newEnv(t)
-	e.setup(t, presetSource(t))
+	e.setup(t)
 
 	status, resp, body := e.dispatch(t, "req-1", nil)
 	if status != http.StatusOK {
@@ -325,30 +294,20 @@ func TestEndToEndDispatchCarriesFullTargetAndProvenance(t *testing.T) {
 		t.Fatalf("overrides = %s", tgt.Overrides)
 	}
 	d := resp.Decision
-	if d.Policy != "dynamic" || d.PolicyVersion != 1 || d.Collection != "c1" ||
-		d.Group != "primary" || d.GroupType != "fast" {
+	if d.Collection != "c1" || d.Group != "primary" || d.GroupType != "fast" {
 		t.Fatalf("decision = %+v", d)
 	}
-}
-
-func TestEndToEndFallbackPathWithoutPolicy(t *testing.T) {
-	e := newEnv(t)
-	e.setup(t, "")
-	status, resp, body := e.dispatch(t, "req-1", nil)
-	if status != http.StatusOK {
-		t.Fatalf("status = %d: %s", status, body)
+	if d.CollectionUpdatedAt.IsZero() {
+		t.Fatalf("decision = %+v, want the collection version stamp", d)
 	}
-	if resp.Target.ModelID != "kimi-1/k3" {
-		t.Fatalf("target = %q, want first member of first group", resp.Target.ModelID)
-	}
-	if resp.Decision.Policy != "" {
-		t.Fatalf("decision = %+v, want no policy provenance", resp.Decision)
+	if len(d.Candidates) != 3 || d.Candidates[0].Phase != "standard" {
+		t.Fatalf("candidates = %+v, want three standard-phase candidates", d.Candidates)
 	}
 }
 
 func TestEndToEndCandidateFallForward(t *testing.T) {
 	e := newEnv(t)
-	e.setup(t, presetSource(t))
+	e.setup(t)
 	e.upstream.resolveFail["kimi-1/k3"] = true
 
 	status, resp, body := e.dispatch(t, "req-1", nil)
@@ -371,7 +330,7 @@ func TestEndToEndCandidateFallForward(t *testing.T) {
 
 func TestEndToEndAllCandidatesFail(t *testing.T) {
 	e := newEnv(t)
-	e.setup(t, presetSource(t))
+	e.setup(t)
 	for _, id := range []string{"kimi-1/k3", "kimi-2/k3", "ark-1/ds"} {
 		e.upstream.resolveFail[id] = true
 	}
@@ -395,7 +354,7 @@ func TestEndToEndAllCandidatesFail(t *testing.T) {
 
 func TestEndToEndTriedIDsAreExcluded(t *testing.T) {
 	e := newEnv(t)
-	e.setup(t, presetSource(t))
+	e.setup(t)
 	status, resp, body := e.dispatch(t, "req-1", []string{"kimi-1/k3", "kimi-2/k3"})
 	if status != http.StatusOK {
 		t.Fatalf("status = %d: %s", status, body)
@@ -405,39 +364,126 @@ func TestEndToEndTriedIDsAreExcluded(t *testing.T) {
 	}
 }
 
-// TestEndToEndPolicyVersionBumpTakesEffect 断言更新源码后的下一次调度用新逻辑，
-// 覆盖编译缓存按版本失效与策略缓存键失效两条路径。
-func TestEndToEndPolicyVersionBumpTakesEffect(t *testing.T) {
+// TestEndToEndStrategyChangeTakesEffectImmediately 策略组合改完即生效，
+// 覆盖集合缓存失效这条路径（SetStrategy 必须让下一次调度看到新组合）。
+func TestEndToEndStrategyChangeTakesEffectImmediately(t *testing.T) {
 	e := newEnv(t)
-	e.setup(t, presetSource(t))
+	e.setup(t)
 
 	_, resp, _ := e.dispatch(t, "req-1", nil)
 	if resp.Target.ModelID != "kimi-1/k3" {
 		t.Fatalf("target = %q", resp.Target.ModelID)
 	}
 
-	payload, err := json.Marshal(map[string]string{
-		"language": "lua",
-		"source":   `return { candidates = { "ark-1/ds" }, note = "v2 forces backup" }`,
+	e.mustAdmin(t, http.MethodPut, "/admin/collections/c1/strategy",
+		`{"priority_chain":["backup","primary"]}`, http.StatusNoContent)
+
+	_, resp, body := e.dispatch(t, "req-2", nil)
+	if resp.Target.ModelID != "ark-1/ds" {
+		t.Fatalf("target = %q, want the new chain to apply: %s", resp.Target.ModelID, body)
+	}
+	if resp.Decision.Group != "backup" {
+		t.Fatalf("decision = %+v", resp.Decision)
+	}
+}
+
+// TestEndToEndGroupExhaustionFailsOverToNextGroup 整组不可用（冷却+已试）
+// 自动跳下一组，并在决策里留下 group_skips 痕迹。
+func TestEndToEndGroupExhaustionFailsOverToNextGroup(t *testing.T) {
+	e := newEnv(t)
+	e.setup(t)
+	e.mustAdmin(t, http.MethodPut, "/admin/collections/c1/strategy",
+		`{"priority_chain":["primary","backup"]}`, http.StatusNoContent)
+
+	// 阈值为 2，两次异常上报即冷却；再叠一个已试，主组整组不可用。
+	for i := 1; i <= 2; i++ {
+		e.internal(t, http.MethodPost, relayv1.DispatchBasePath+"/results",
+			fmt.Sprintf(`{"report_id":"rep-cool-%d","model_id":"kimi-1/k3","outcome":"abnormal"}`, i))
+	}
+
+	status, resp, body := e.dispatch(t, "req-1", []string{"kimi-2/k3"})
+	if status != http.StatusOK {
+		t.Fatalf("status = %d: %s", status, body)
+	}
+	if resp.Target.ModelID != "ark-1/ds" {
+		t.Fatalf("target = %q, want failover into backup", resp.Target.ModelID)
+	}
+	if len(resp.Decision.GroupSkips) != 1 || resp.Decision.GroupSkips[0].Group != "primary" {
+		t.Fatalf("group skips = %+v, want primary skipped", resp.Decision.GroupSkips)
+	}
+}
+
+// TestEndToEndOverflowRoutesToCompactPool 超长请求走压缩托管：
+// 压缩组候选在前（compact 阶段），原组候选在后（resume 阶段）。
+func TestEndToEndOverflowRoutesToCompactPool(t *testing.T) {
+	e := newEnv(t)
+	e.setup(t)
+	e.mustAdmin(t, http.MethodPut, "/admin/collections/c1/strategy",
+		`{"priority_chain":["primary"],"overflow":{"enabled":true,"threshold_tokens":1000,"compact_groups":["backup"]}}`,
+		http.StatusNoContent)
+
+	payload, err := json.Marshal(relayv1.DispatchRequest{
+		Model: "sonnet", InboundProtocol: relayv1.ProtocolAnthropic,
+		ClientKey: "sk-client", RequestID: "req-over", EstTokens: 5000,
 	})
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	e.mustAdmin(t, http.MethodPut, "/admin/policies/dynamic", string(payload), http.StatusOK)
-
-	_, resp, body := e.dispatch(t, "req-2", nil)
-	if resp.Target.ModelID != "ark-1/ds" {
-		t.Fatalf("target = %q, want the new logic to apply: %s", resp.Target.ModelID, body)
+	status, body := e.internal(t, http.MethodPost, relayv1.DispatchBasePath+"/dispatch", string(payload))
+	if status != http.StatusOK {
+		t.Fatalf("status = %d: %s", status, body)
 	}
-	if resp.Decision.PolicyVersion != 2 || resp.Decision.Note != "v2 forces backup" {
-		t.Fatalf("decision = %+v", resp.Decision)
+	var resp relayv1.DispatchResponse
+	if err := json.Unmarshal([]byte(body), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp.Target.ModelID != "ark-1/ds" {
+		t.Fatalf("target = %q, want the compact pool under overflow", resp.Target.ModelID)
+	}
+	want := []relayv1.PhasedCandidate{
+		{ModelID: "ark-1/ds", Phase: "compact"},
+		{ModelID: "kimi-1/k3", Phase: "resume"},
+		{ModelID: "kimi-2/k3", Phase: "resume"},
+	}
+	if fmt.Sprint(resp.Decision.Candidates) != fmt.Sprint(want) {
+		t.Fatalf("candidates = %v, want %v", resp.Decision.Candidates, want)
+	}
+}
+
+func TestEndToEndStrategyValidationRejectsUnknownGroup(t *testing.T) {
+	e := newEnv(t)
+	e.setup(t)
+	status, body := e.admin(t, http.MethodPut, "/admin/collections/c1/strategy",
+		`{"priority_chain":["ghost"]}`)
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400: %s", status, body)
+	}
+	if !strings.Contains(body, "ghost") {
+		t.Fatalf("body %s should name the unknown group", body)
+	}
+}
+
+// TestEndToEndDeleteGroupReferencedByStrategyIsConflict 被组合引用的组
+// 不允许静默删除，409 必须指出引用位置。
+func TestEndToEndDeleteGroupReferencedByStrategyIsConflict(t *testing.T) {
+	e := newEnv(t)
+	e.setup(t)
+	e.mustAdmin(t, http.MethodPut, "/admin/collections/c1/strategy",
+		`{"priority_chain":["primary","backup"]}`, http.StatusNoContent)
+
+	status, body := e.admin(t, http.MethodDelete, "/admin/collections/c1/groups/backup", "")
+	if status != http.StatusConflict {
+		t.Fatalf("status = %d, want 409: %s", status, body)
+	}
+	if !strings.Contains(body, "priority_chain") {
+		t.Fatalf("body %s should name the referencing strategy section", body)
 	}
 }
 
 // TestEndToEndMemberChangeInvalidatesCache 断言改成员后下一次调度立即可见。
 func TestEndToEndMemberChangeInvalidatesCache(t *testing.T) {
 	e := newEnv(t)
-	e.setup(t, presetSource(t))
+	e.setup(t)
 
 	_, resp, _ := e.dispatch(t, "req-1", nil)
 	if resp.Target.ModelID != "kimi-1/k3" {
@@ -456,7 +502,7 @@ func TestEndToEndMemberChangeInvalidatesCache(t *testing.T) {
 // TestEndToEndCoolingExcludesTargetOnNextDispatch 覆盖上报 → 冷却 → 排除全链路。
 func TestEndToEndCoolingExcludesTargetOnNextDispatch(t *testing.T) {
 	e := newEnv(t)
-	e.setup(t, presetSource(t))
+	e.setup(t)
 
 	// 阈值为 2，两次异常上报即冷却。
 	for i := 1; i <= 2; i++ {
@@ -488,7 +534,7 @@ func TestEndToEndCoolingExcludesTargetOnNextDispatch(t *testing.T) {
 
 func TestEndToEndDuplicateReportIsIdempotent(t *testing.T) {
 	e := newEnv(t)
-	e.setup(t, presetSource(t))
+	e.setup(t)
 	const payload = `{"report_id":"rep-dup","request_id":"req-1","model_id":"kimi-1/k3","outcome":"abnormal"}`
 
 	_, first := e.internal(t, http.MethodPost, relayv1.DispatchBasePath+"/results", payload)
@@ -511,7 +557,7 @@ func TestEndToEndDuplicateReportIsIdempotent(t *testing.T) {
 
 func TestEndToEndRuntimeResetRestoresTarget(t *testing.T) {
 	e := newEnv(t)
-	e.setup(t, presetSource(t))
+	e.setup(t)
 	for i := 1; i <= 2; i++ {
 		e.internal(t, http.MethodPost, relayv1.DispatchBasePath+"/results",
 			fmt.Sprintf(`{"report_id":"r-%d","model_id":"kimi-1/k3","outcome":"abnormal"}`, i))
@@ -531,7 +577,7 @@ func TestEndToEndRuntimeResetRestoresTarget(t *testing.T) {
 
 func TestEndToEndUnknownMemberReferenceRejected(t *testing.T) {
 	e := newEnv(t)
-	e.setup(t, "")
+	e.setup(t)
 	status, body := e.admin(t, http.MethodPut, "/admin/collections/c1/groups/primary/members",
 		`{"members":["ghost/model"]}`)
 	if status != http.StatusBadRequest {
@@ -544,7 +590,7 @@ func TestEndToEndUnknownMemberReferenceRejected(t *testing.T) {
 
 func TestEndToEndDisabledCatalogModelIsSkipped(t *testing.T) {
 	e := newEnv(t)
-	e.setup(t, presetSource(t))
+	e.setup(t)
 	// 先跑一次预热缓存，再让目录把首选标为停用。
 	e.dispatch(t, "req-warm", nil)
 	e.upstream.disabled["kimi-1/k3"] = true
@@ -567,89 +613,18 @@ func TestEndToEndDisabledCatalogModelIsSkipped(t *testing.T) {
 	}
 }
 
-func TestEndToEndEmptyPolicyResultSkipsUpstream(t *testing.T) {
+func TestEndToEndStrategyDryRunDoesNotTouchRuntime(t *testing.T) {
 	e := newEnv(t)
-	e.setup(t, `return { candidates = {}, note = "deliberately empty" }`)
+	e.setup(t)
 	before := e.upstream.resolveCalls.Load()
 
-	status, _, body := e.dispatch(t, "req-1", nil)
-	if status != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, want 503: %s", status, body)
-	}
-	if e.upstream.resolveCalls.Load() != before {
-		t.Fatal("an empty candidate list must not reach upstream resolve")
-	}
-}
-
-func TestEndToEndPolicyRuntimeErrorIsNotRetryable(t *testing.T) {
-	e := newEnv(t)
-	e.setup(t, `local x = nil; return x.boom`)
-	status, _, body := e.dispatch(t, "req-1", nil)
-	if status != http.StatusInternalServerError {
-		t.Fatalf("status = %d, want 500: %s", status, body)
-	}
-	var env relayv1.ErrorEnvelope
-	if err := json.Unmarshal([]byte(body), &env); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if env.Error.Code != "policy_error" || env.Error.Retryable {
-		t.Fatalf("error = %+v, want non-retryable policy_error", env.Error)
-	}
-}
-
-func TestEndToEndPolicyWithUncompilableSourceRejectedAtSave(t *testing.T) {
-	e := newEnv(t)
-	e.setup(t, "")
-	status, body := e.admin(t, http.MethodPost, "/admin/policies",
-		`{"name":"broken","language":"lua","source":"return ((("}`)
-	if status != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400: %s", status, body)
-	}
-	if !strings.Contains(body, "compile error") {
-		t.Fatalf("body %s should explain the compile failure", body)
-	}
-}
-
-func TestEndToEndUnsupportedLanguageRejected(t *testing.T) {
-	e := newEnv(t)
-	e.setup(t, "")
-	status, body := e.admin(t, http.MethodPost, "/admin/policies",
-		`{"name":"py","language":"python","source":"pass"}`)
-	if status != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400: %s", status, body)
-	}
-	for _, want := range []string{"lua", "javascript", "typescript"} {
-		if !strings.Contains(body, want) {
-			t.Fatalf("body %s should list %q as supported", body, want)
-		}
-	}
-}
-
-func TestEndToEndDeletePolicyBoundToUserModelIsConflict(t *testing.T) {
-	e := newEnv(t)
-	e.setup(t, presetSource(t))
-	status, body := e.admin(t, http.MethodDelete, "/admin/policies/dynamic", "")
-	if status != http.StatusConflict {
-		t.Fatalf("status = %d, want 409: %s", status, body)
-	}
-	if !strings.Contains(body, "sonnet") {
-		t.Fatalf("body %s should name the referencing user model", body)
-	}
-}
-
-func TestEndToEndDryRunDoesNotTouchRuntime(t *testing.T) {
-	e := newEnv(t)
-	e.setup(t, presetSource(t))
-	before := e.upstream.resolveCalls.Load()
-
-	status, body := e.admin(t, http.MethodPost, "/admin/policies/dynamic/dry-run",
-		`{"collection":"c1","request":{"user_model":"sonnet","est_tokens":10},
-		  "runtime":{"kimi-1/k3":{"cooling":true}}}`)
+	status, body := e.admin(t, http.MethodPost, "/admin/collections/c1/strategy/dry-run",
+		`{"est_tokens":10,"tried_ids":["kimi-1/k3"]}`)
 	if status != http.StatusOK {
 		t.Fatalf("status = %d: %s", status, body)
 	}
-	if !strings.Contains(body, "kimi-1/k3") {
-		t.Fatalf("body %s should contain the decision", body)
+	if !strings.Contains(body, "kimi-2/k3") {
+		t.Fatalf("body %s should contain the composed sequence", body)
 	}
 	if e.upstream.resolveCalls.Load() != before {
 		t.Fatal("dry-run must not resolve targets")
@@ -660,97 +635,5 @@ func TestEndToEndDryRunDoesNotTouchRuntime(t *testing.T) {
 	}
 	if state.Cooling || state.ConsecutiveFailures != 0 {
 		t.Fatalf("dry-run mutated runtime state: %+v", state)
-	}
-}
-
-func TestEndToEndDispatchAuthFailures(t *testing.T) {
-	e := newEnv(t)
-	e.setup(t, presetSource(t))
-	cases := []struct {
-		name string
-		body string
-		want int
-	}{
-		{"unknown model", `{"model":"ghost","client_key":"sk-client","request_id":"r"}`, http.StatusNotFound},
-		{"wrong key", `{"model":"sonnet","client_key":"nope","request_id":"r"}`, http.StatusUnauthorized},
-		{"wrong protocol", `{"model":"sonnet","inbound_protocol":"gemini","client_key":"sk-client","request_id":"r"}`, http.StatusBadRequest},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			status, body := e.internal(t, http.MethodPost, relayv1.DispatchBasePath+"/dispatch", tc.body)
-			if status != tc.want {
-				t.Fatalf("status = %d, want %d: %s", status, tc.want, body)
-			}
-		})
-	}
-}
-
-func TestEndToEndDisabledUserModelRejected(t *testing.T) {
-	e := newEnv(t)
-	e.setup(t, presetSource(t))
-	e.mustAdmin(t, http.MethodPut, "/admin/user-models/sonnet",
-		`{"collection":"c1","policy":"dynamic","client_key":"sk-client","protocol":"anthropic","enabled":false}`,
-		http.StatusOK)
-
-	status, _, body := e.dispatch(t, "req-1", nil)
-	if status != http.StatusForbidden {
-		t.Fatalf("status = %d, want 403: %s", status, body)
-	}
-}
-
-func TestEndToEndHealthReportsComponents(t *testing.T) {
-	e := newEnv(t)
-	// 不带任何密钥：健康检查免鉴权。
-	status, body := e.request(t, http.MethodGet, relayv1.HealthPath, "", nil)
-	if status != http.StatusOK {
-		t.Fatalf("status = %d: %s", status, body)
-	}
-	var got relayv1.HealthResponse
-	if err := json.Unmarshal([]byte(body), &got); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if !got.Ready || !got.Database || !got.Upstream {
-		t.Fatalf("health = %+v", got)
-	}
-	if wantCache := os.Getenv("TEST_REDIS_ADDR") != ""; got.Cache != wantCache {
-		t.Fatalf("cache = %v, want %v", got.Cache, wantCache)
-	}
-}
-
-func TestEndToEndModelsListing(t *testing.T) {
-	e := newEnv(t)
-	e.setup(t, presetSource(t))
-	status, body := e.internal(t, http.MethodGet, relayv1.DispatchBasePath+"/models", "")
-	if status != http.StatusOK {
-		t.Fatalf("status = %d: %s", status, body)
-	}
-	var got relayv1.ModelsResponse
-	if err := json.Unmarshal([]byte(body), &got); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if len(got.Models) != 1 || got.Models[0].Name != "sonnet" || got.Models[0].Policy != "dynamic" {
-		t.Fatalf("models = %+v", got.Models)
-	}
-	if strings.Contains(body, "sk-client") {
-		t.Fatalf("listing leaks the client key: %s", body)
-	}
-}
-
-func TestEndToEndKeyIsolation(t *testing.T) {
-	e := newEnv(t)
-	status, _ := e.request(t, http.MethodGet, "/admin/collections", "",
-		map[string]string{"Authorization": "Bearer " + dispatchKey})
-	if status != http.StatusUnauthorized {
-		t.Fatalf("dispatch key on admin = %d, want 401", status)
-	}
-	status, _ = e.request(t, http.MethodGet, relayv1.DispatchBasePath+"/models", "",
-		map[string]string{"Authorization": "Bearer " + adminKey})
-	if status != http.StatusUnauthorized {
-		t.Fatalf("admin key on dispatch = %d, want 401", status)
-	}
-	// 健康检查在两面之外：无密钥可达。
-	status, _ = e.request(t, http.MethodGet, relayv1.HealthPath, "", nil)
-	if status != http.StatusOK {
-		t.Fatalf("healthz without key = %d, want 200", status)
 	}
 }

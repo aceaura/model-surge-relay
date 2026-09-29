@@ -21,13 +21,14 @@ func groups() []Group {
 
 func TestCompose(t *testing.T) {
 	cases := []struct {
-		name      string
-		strategy  Strategy
-		states    map[string]runstate.State
-		tried     []string
-		estTokens int
-		wantCands []Candidate
-		wantSkips []GroupSkip
+		name            string
+		strategy        Strategy
+		states          map[string]runstate.State
+		tried           []string
+		estTokens       int
+		wantCands       []Candidate
+		wantMemberSkips []MemberSkip
+		wantSkips       []GroupSkip
 	}{
 		{
 			name:     "空链退化为快照组序",
@@ -48,6 +49,10 @@ func TestCompose(t *testing.T) {
 				"a/1": {Cooling: true}, "a/2": {Cooling: true},
 			},
 			wantCands: []Candidate{{"b/1", PhaseStandard}},
+			wantMemberSkips: []MemberSkip{
+				{ModelID: "a/1", Group: "main", Reason: SkipCooling},
+				{ModelID: "a/2", Group: "main", Reason: SkipCooling},
+			},
 			wantSkips: []GroupSkip{{Group: "main", Reason: GroupExhausted, Detail: "all 2 members unavailable"}},
 		},
 		{
@@ -55,12 +60,18 @@ func TestCompose(t *testing.T) {
 			strategy:  Strategy{PriorityChain: []string{"main", "backup"}},
 			states:    map[string]runstate.State{"a/1": {Cooling: true}},
 			wantCands: []Candidate{{"a/2", PhaseStandard}, {"b/1", PhaseStandard}},
+			wantMemberSkips: []MemberSkip{
+				{ModelID: "a/1", Group: "main", Reason: SkipCooling},
+			},
 		},
 		{
-			name:      "已试过/禁用/目录未知均判不可用",
+			name:      "已试过判不可用并记成员跳过",
 			strategy:  Strategy{PriorityChain: []string{"main"}},
 			tried:     []string{"a/1"},
 			wantCands: []Candidate{{"a/2", PhaseStandard}},
+			wantMemberSkips: []MemberSkip{
+				{ModelID: "a/1", Group: "main", Reason: SkipAlreadyTried},
+			},
 		},
 		{
 			name:      "链内组运行期被删降级为跳过",
@@ -109,6 +120,9 @@ func TestCompose(t *testing.T) {
 			estTokens: 500,
 			states:    map[string]runstate.State{"c/1": {Cooling: true}},
 			wantCands: []Candidate{{"a/1", PhaseResume}, {"a/2", PhaseResume}},
+			wantMemberSkips: []MemberSkip{
+				{ModelID: "c/1", Group: "compact", Reason: SkipCooling},
+			},
 			wantSkips: []GroupSkip{{Group: "compact", Reason: GroupExhausted, Detail: "all 1 members unavailable"}},
 		},
 		{
@@ -127,6 +141,11 @@ func TestCompose(t *testing.T) {
 				"a/1": {Cooling: true}, "a/2": {Cooling: true}, "b/1": {Cooling: true},
 			},
 			wantCands: []Candidate{},
+			wantMemberSkips: []MemberSkip{
+				{ModelID: "a/1", Group: "main", Reason: SkipCooling},
+				{ModelID: "a/2", Group: "main", Reason: SkipCooling},
+				{ModelID: "b/1", Group: "backup", Reason: SkipCooling},
+			},
 			wantSkips: []GroupSkip{
 				{Group: "main", Reason: GroupExhausted, Detail: "all 2 members unavailable"},
 				{Group: "backup", Reason: GroupExhausted, Detail: "all 1 members unavailable"},
@@ -136,9 +155,16 @@ func TestCompose(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			cands, skips := Compose(groups(), tc.states, tc.tried, tc.estTokens, tc.strategy)
+			cands, memberSkips, skips := Compose(groups(), tc.states, tc.tried, tc.estTokens, tc.strategy)
 			if !reflect.DeepEqual(cands, tc.wantCands) {
 				t.Errorf("candidates = %+v, want %+v", cands, tc.wantCands)
+			}
+			wantMemberSkips := tc.wantMemberSkips
+			if wantMemberSkips == nil {
+				wantMemberSkips = []MemberSkip{}
+			}
+			if !reflect.DeepEqual(memberSkips, wantMemberSkips) {
+				t.Errorf("member skips = %+v, want %+v", memberSkips, wantMemberSkips)
 			}
 			wantSkips := tc.wantSkips
 			if wantSkips == nil {

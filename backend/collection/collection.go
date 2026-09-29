@@ -30,10 +30,12 @@ type Group struct {
 
 // Snapshot 是策略输入与调度过滤共用的视图：成员已带目录属性，
 // 并随快照携带集合的策略组合（与配置同一份缓存，调度不再多一次读）。
+// UpdatedAt 是集合配置版本戳，决策溯源据此关联做出决策的组合版本。
 type Snapshot struct {
-	Name     string            `json:"name"`
-	Strategy strategy.Strategy `json:"strategy"`
-	Groups   []GroupSnapshot   `json:"groups"`
+	Name      string            `json:"name"`
+	Strategy  strategy.Strategy `json:"strategy"`
+	UpdatedAt time.Time         `json:"updated_at,omitzero"`
+	Groups    []GroupSnapshot   `json:"groups"`
 }
 
 // MarshalJSON 保证 groups 恒为数组而非 null：策略脚本直接遍历这个字段，
